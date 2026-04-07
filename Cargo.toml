@@ -1,0 +1,12 @@
+[package]
+name = "feedback"
+version = "0.1.0"
+edition = "2021"
+description = "Agentic workflow stability governor using Volterra integral pressure analysis"
+
+[dependencies]
+volterra-stability = { path = "../volterra-stability" }
+nalgebra = "0.33"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

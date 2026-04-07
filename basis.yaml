@@ -1,0 +1,91 @@
+governance:
+  version: "1.0"
+  model: linguistic
+  check_tests: false
+
+# ── feedback is governed by Basis ──────────────────────────────────
+#
+# Functional core:
+#   dictionary     — Inert nouns. Channel config, decision types, hook protocol.
+#   laboratory     — Pure logic. Pressure model, nonlinear dynamics, spectral monitor.
+#
+# Imperative shell:
+#   hands          — IO-dependent. Governor runtime, hook integration, session logging.
+
+# ── External Layers ──────────────────────────────────────────────────
+
+layers:
+  stability-analysis:
+    external: true
+    role: "Volterra integral stability analysis"
+    packages: [volterra-stability, volterra_stability]
+
+  linear-algebra:
+    external: true
+    role: "Matrix and vector computation"
+    packages: [nalgebra]
+
+  serialization:
+    external: true
+    role: "Serialization and deserialization"
+    packages: [serde, serde_json, thiserror]
+
+  rust-internal:
+    external: true
+    role: "Rust language-internal imports"
+    packages: [crate, super, self, std, core, alloc]
+
+# ── Internal Layers ──────────────────────────────────────────────────
+
+  dictionary:
+    role: "Inert nouns. Channel definitions, decision types, hook protocol DTOs."
+    packages:
+      - "src/channels"
+      - "src/decision"
+      - "src/hook_protocol"
+    rules:
+      purity: strict
+      io: forbidden
+      network: forbidden
+      async: forbidden
+    depends_on: [stability-analysis, serialization, rust-internal]
+
+  laboratory:
+    role: "Pure logic. Coupling model, nonlinear dynamics, spectral monitoring."
+    packages:
+      - "src/pressure_model"
+      - "src/dynamics"
+      - "src/monitor"
+    rules:
+      purity: strict
+      io: forbidden
+      network: forbidden
+      async: forbidden
+    depends_on: [dictionary, stability-analysis, linear-algebra, serialization, rust-internal]
+
+  hands:
+    role: "IO-dependent. Real-time governor, Claude Code hook integration, session logging."
+    packages:
+      - "src/governor"
+      - "src/hooks"
+      - "src/session"
+    rules:
+      purity: relaxed
+      io: allowed
+      network: forbidden
+      async: allowed
+    depends_on: [laboratory, dictionary, stability-analysis, serialization, rust-internal]
+
+# ── Purity Axis ──────────────────────────────────────────────────────
+
+purity:
+  enabled: true
+  forbidden_in_strict:
+    - "file_io"
+    - "network_io"
+    - "stdout"
+    - "stderr"
+    - "env_vars"
+    - "system_clock"
+    - "subprocess"
+    - "process"
