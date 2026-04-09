@@ -19,26 +19,4 @@ flutter_app/*
 *.iml
 .DS_Store
 
-# ----------------------------------------------------------------------------
-# PHALANX FFI ARTIFACTS 
-# ----------------------------------------------------------------------------
-*.dll
-*.dylib
-*.so
-*.a
-*.lib
-
-phalanx-ffi/phalanx.h
-
-# ----------------------------------------------------------------------------
-# SECURITY & SECRETS 
-# ----------------------------------------------------------------------------
-swarm.key
-swarm.key.pub
-ed25519_secret.pem
-ed25519_public.pem
-
-# Simulation Vaults
-sim_vault/
-storage_vault/
-*.bin
+*.jsonl
