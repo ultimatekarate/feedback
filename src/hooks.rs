@@ -154,10 +154,18 @@ pub fn handle_pre_tool_use(
     // Apply all impulses (including progress stall accumulation)
     apply_impulses(&input, governor);
 
-    // Evaluate the pressure state
-    let verdict = governor.evaluate(&input.tool_name);
+    // Evaluate the pressure state. We pass the actual tool_input
+    // through so warn-zone Modify verdicts can produce concrete
+    // patched arguments (e.g., capping a Read's `limit`).
+    let verdict = governor.evaluate_with_input(&input.tool_name, Some(&input.tool_input));
 
-    // Convert to hook output
+    // Convert to hook output. The Modify branch has two sub-cases:
+    // a tool-specific patch produced an `updated_input` (then we use
+    // allow_with_modification), or only `additional_context` is set
+    // (then we surface the warning text via allow_with_warning so the
+    // agent still sees the guidance even though we aren't patching
+    // the call). Either way the warning reason makes it back to the
+    // agent — never silently dropped.
     let output = match verdict.decision {
         Decision::Allow => HookOutput::allow(),
         Decision::Deny { ref reason } => HookOutput::deny(reason),
@@ -168,7 +176,7 @@ pub fn handle_pre_tool_use(
             Some(updated) => {
                 HookOutput::allow_with_modification(reason, updated.clone())
             }
-            None => HookOutput::allow(),
+            None => HookOutput::allow_with_warning(reason),
         },
     };
 

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use volterra_stability::config::ImpulseRates;
 use volterra_stability::integral::IntegralBank;
 
@@ -13,6 +14,26 @@ use crate::channels::{Channel, FeedbackConfig};
 use crate::decision::GovernorVerdict;
 use crate::monitor;
 use crate::pressure_model::AgentCouplingModel;
+
+/// Serializable snapshot of the parts of `Governor` that have to
+/// survive across process boundaries. Used by `feedback-hook` to
+/// persist state to disk between PreToolUse invocations — each hook
+/// invocation is a separate process, so without this the governor
+/// would start fresh every time and never accumulate pressure.
+///
+/// `model`, `config`, and `rates` are NOT included: they are
+/// reconstructed from `FeedbackConfig::from_defaults()` on resume.
+/// If those defaults ever diverge between save and load (e.g. a
+/// new feedback build with retuned thresholds), the resumed
+/// governor uses the *new* defaults — bank values still apply
+/// against the new thresholds, which is the desired behavior.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedState {
+    pub bank: IntegralBank,
+    pub file_access_counts: HashMap<String, usize>,
+    pub last_call_t: f64,
+    pub cumulative_cost: f64,
+}
 
 /// The live stability governor.
 ///
@@ -24,6 +45,14 @@ pub struct Governor {
     config: FeedbackConfig,
     rates: ImpulseRates,
     epoch: Instant,
+    /// Time offset added to `epoch.elapsed()` when computing `now()`.
+    /// Zero for fresh governors. For governors resumed from a
+    /// `PersistedState`, equals the saved `last_call_t` so that the
+    /// new process's clock picks up exactly where the old one stopped
+    /// — keeping the IntegralBank's per-channel `last_update`
+    /// timestamps in the same time domain across the persistence
+    /// boundary.
+    time_offset: f64,
     /// Per-file access count for repetition tracking.
     /// Key is normalized file path. Value >= 2 means "revisit."
     file_access_counts: HashMap<String, usize>,
@@ -49,9 +78,45 @@ impl Governor {
             config,
             rates,
             epoch: Instant::now(),
+            time_offset: 0.0,
             file_access_counts: HashMap::new(),
             last_call_t: 0.0,
             cumulative_cost: 0.0,
+        }
+    }
+
+    /// Resume a governor from a persisted state. The new process's
+    /// clock continues from where the previous one stopped — see the
+    /// docstring on `time_offset` for the time-domain trick. The
+    /// model, config, and rates are reconstructed from defaults
+    /// rather than persisted; if you need a non-default tuning,
+    /// resume manually via the field-by-field constructor.
+    pub fn resume_from_defaults(state: PersistedState) -> Self {
+        let config = FeedbackConfig::from_defaults();
+        let rates = ImpulseRates::from_slice(&[50.0, 0.38, 0.01, 0.1, 0.12]);
+        let model = AgentCouplingModel::new(config.clone());
+        Self {
+            model,
+            bank: state.bank,
+            config,
+            rates,
+            epoch: Instant::now(),
+            time_offset: state.last_call_t.max(0.0),
+            file_access_counts: state.file_access_counts,
+            last_call_t: state.last_call_t,
+            cumulative_cost: state.cumulative_cost,
+        }
+    }
+
+    /// Take a serializable snapshot of the parts of `self` that need
+    /// to survive across process boundaries. Cheap (clones a small
+    /// `IntegralBank` and a `HashMap<String, usize>`).
+    pub fn snapshot(&self) -> PersistedState {
+        PersistedState {
+            bank: self.bank.clone(),
+            file_access_counts: self.file_access_counts.clone(),
+            last_call_t: self.last_call_t,
+            cumulative_cost: self.cumulative_cost,
         }
     }
 
@@ -70,9 +135,13 @@ impl Governor {
         Self::new(config, rates)
     }
 
-    /// Current time in seconds since governor creation.
+    /// Current time in seconds in the governor's time domain. For a
+    /// fresh governor this equals seconds since construction. For a
+    /// resumed governor it equals saved-`last_call_t` plus seconds
+    /// since this process started — keeping the time domain stable
+    /// across the persistence boundary.
     fn now(&self) -> f64 {
-        self.epoch.elapsed().as_secs_f64()
+        self.epoch.elapsed().as_secs_f64() + self.time_offset
     }
 
     /// Record a cost increment. Cost is a standalone metric (cumulative
@@ -136,7 +205,26 @@ impl Governor {
     }
 
     /// Evaluate the current pressure state and produce a verdict.
+    ///
+    /// This is the input-agnostic entry point used by callers that
+    /// only know which tool is about to run (e.g., the Coalition MCP
+    /// server's `feedback_evaluate` tool). Without an input value,
+    /// warn-zone Modify verdicts can only carry guidance, not a
+    /// patched input. For the hook-side path that DOES have the
+    /// tool's arguments, prefer `evaluate_with_input`.
     pub fn evaluate(&self, tool_name: &str) -> GovernorVerdict {
+        self.evaluate_with_input(tool_name, None)
+    }
+
+    /// Evaluate the current pressure state with the tool's input
+    /// arguments in hand. Lets the monitor produce concrete patched
+    /// `updated_input` values for warn-zone Modify verdicts (e.g.,
+    /// capping a Read's `limit` or a Bash's `timeout`).
+    pub fn evaluate_with_input(
+        &self,
+        tool_name: &str,
+        tool_input: Option<&serde_json::Value>,
+    ) -> GovernorVerdict {
         let now = self.now();
         let values = self.bank.current_values(now);
 
@@ -145,6 +233,7 @@ impl Governor {
             &snapshot,
             &self.config.thresholds,
             tool_name,
+            tool_input,
         );
 
         GovernorVerdict {
@@ -194,5 +283,54 @@ mod tests {
             values[Channel::Error.index()] > 0.0,
             "error channel should have pressure after impulse"
         );
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_pressure() {
+        // Save state from one governor, resume into another, and
+        // verify the pressure carries over. This is the core
+        // invariant the feedback-hook binary depends on.
+        let mut gov1 = Governor::from_defaults();
+        gov1.record_impulse(Channel::Error, 3.5);
+        gov1.record_impulse(Channel::Context, 1500.0);
+        gov1.record_file_access("/some/path.rs");
+        gov1.record_cost(0.05);
+        let values_before = gov1.current_values();
+        let cost_before = gov1.cumulative_cost();
+
+        // Snapshot → JSON → snapshot, the trip the binary actually makes.
+        let snap = gov1.snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let snap2: PersistedState = serde_json::from_str(&json).expect("deserialize");
+
+        let gov2 = Governor::resume_from_defaults(snap2);
+        let values_after = gov2.current_values();
+        let cost_after = gov2.cumulative_cost();
+
+        // Cost is exact — it's just an f64.
+        assert_eq!(cost_before, cost_after, "cost must roundtrip exactly");
+
+        // Bank values may differ by a tiny amount due to whatever
+        // wall-clock time elapsed between the two `current_values`
+        // calls — both are decayed at read time. Tolerance covers
+        // a millisecond's worth of decay at the slowest channel.
+        for i in 0..values_before.len() {
+            let diff = (values_before[i] - values_after[i]).abs();
+            assert!(
+                diff < 0.01,
+                "channel {} drifted too much across snapshot/resume: {} -> {}",
+                i,
+                values_before[i],
+                values_after[i]
+            );
+        }
+
+        // File access count survived.
+        let n = gov2
+            .file_access_counts
+            .get("/some/path.rs")
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(n, 1, "file access count must roundtrip");
     }
 }

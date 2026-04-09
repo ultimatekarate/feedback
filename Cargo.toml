@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Agentic workflow stability governor using Volterra integral pressure analysis"
 
+[[bin]]
+name = "feedback-hook"
+path = "src/bin/feedback_hook.rs"
+
 [dependencies]
 volterra-stability = { path = "../volterra-stability" }
 nalgebra = "0.33"

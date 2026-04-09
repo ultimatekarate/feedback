@@ -79,6 +79,22 @@ impl HookOutput {
             },
         }
     }
+
+    /// Construct an "allow" response with a warning reason but no
+    /// input modification. Used for the warn-zone middle tier where
+    /// the governor wants to surface guidance to the agent without
+    /// actually patching the tool call (e.g., the channel is in the
+    /// warning zone but no useful patch exists for this tool name).
+    pub fn allow_with_warning(reason: &str) -> Self {
+        Self {
+            hook_specific_output: HookDecision {
+                hook_event_name: "PreToolUse".into(),
+                permission_decision: "allow".into(),
+                permission_decision_reason: reason.to_string(),
+                updated_input: None,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +121,16 @@ mod tests {
         let json = r#"{"tool_name":"Read","tool_input":{"file_path":"/foo/bar.rs"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.tool_name, "Read");
+    }
+
+    #[test]
+    fn allow_with_warning_carries_reason_without_modification() {
+        let output = HookOutput::allow_with_warning("context at 72% of critical");
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"permissionDecision\":\"allow\""));
+        assert!(json.contains("context at 72% of critical"));
+        // No updatedInput field — must be omitted, not null,
+        // because skip_serializing_if = "Option::is_none".
+        assert!(!json.contains("updatedInput"));
     }
 }

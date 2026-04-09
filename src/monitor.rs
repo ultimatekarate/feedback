@@ -10,7 +10,7 @@ use volterra_stability::scaler::composite_stress;
 use volterra_stability::spectral::analyze_spectral_gap;
 
 use crate::channels::{Channel, ChannelThresholds};
-use crate::decision::{Decision, PressureSnapshot};
+use crate::decision::{Decision, PressureSnapshot, ToolPatch};
 use crate::pressure_model::AgentCouplingModel;
 
 /// Build a PressureSnapshot from the current integral values.
@@ -49,19 +49,36 @@ pub fn check_stability(
 
 /// Pure decision logic: map a pressure snapshot to a governor Decision.
 ///
-/// Three levels of intervention:
-/// 1. Stable and below warn thresholds → Allow
-/// 2. Any channel above warn threshold → Allow with warning logged
-/// 3. Any channel above deny threshold OR system unstable → Deny
+/// Four levels of intervention, checked in order:
+/// 1. System spectrally unstable                       → Deny (cascading)
+/// 2. Any channel above its deny threshold             → Deny (channel-specific)
+/// 3. Spectral gap below 1e-6 (instability boundary)   → Deny (margin)
+/// 4. Any channel in the warn zone (warn < n ≤ deny)   → Modify
+///    - If a tool-specific patch exists for the
+///      (channel, tool_name) pair AND tool_input is
+///      supplied, the Modify carries an updated_input
+///      that conservatively narrows the call (e.g.,
+///      cap a Read's `limit`, cap a Bash's `timeout`).
+///    - Otherwise the Modify carries only an
+///      `additional_context` warning so the agent
+///      sees the guidance even with no input patch.
+/// 5. Otherwise                                        → Allow
+///
+/// `tool_input` is the raw JSON arguments the agent supplied for the
+/// tool call. It's optional because some callers (e.g., the Coalition
+/// MCP server's `feedback_evaluate` tool) only know the tool name and
+/// have no actual input to patch. When `None`, warn-zone Modify
+/// verdicts will only carry `additional_context`, never `updated_input`.
 pub fn evaluate_decision(
     snapshot: &PressureSnapshot,
     thresholds: &ChannelThresholds,
     tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
 ) -> Decision {
     let cfg = crate::channels::FeedbackConfig::from_defaults();
     let criticals = cfg.system.criticals();
 
-    // Check for instability — immediate deny
+    // 1. Check for instability — immediate deny
     if !snapshot.is_stable {
         return Decision::Deny {
             reason: format!(
@@ -72,7 +89,7 @@ pub fn evaluate_decision(
         };
     }
 
-    // Check per-channel deny thresholds
+    // 2. Check per-channel deny thresholds
     for ch in Channel::ALL {
         let i = ch.index();
         let normalized = snapshot.values[i] / criticals[i];
@@ -88,7 +105,7 @@ pub fn evaluate_decision(
         }
     }
 
-    // Check spectral gap — if it's narrowing, warn.
+    // 3. Check spectral gap — narrow gap is a hidden instability.
     if snapshot.spectral_gap < 1e-6 && snapshot.is_stable {
         return Decision::Deny {
             reason: format!(
@@ -100,7 +117,153 @@ pub fn evaluate_decision(
         };
     }
 
+    // 4. Check per-channel warn thresholds. The first channel in
+    //    priority order whose normalized value lands in the warn band
+    //    (warn < normalized ≤ deny) yields a Modify verdict.
+    for ch in Channel::ALL {
+        let i = ch.index();
+        let normalized = snapshot.values[i] / criticals[i];
+        if normalized > thresholds.warn[i] {
+            return build_warn_modify(ch, tool_name, tool_input, normalized);
+        }
+    }
+
+    // 5. All clear.
     Decision::Allow
+}
+
+/// Build a `Decision::Modify` verdict for a warn-zone channel.
+///
+/// When `tool_input` is supplied AND the (channel, tool_name) pair has
+/// a known conservative patch, the resulting `ToolPatch` carries an
+/// `updated_input` value the hook layer can use as the replacement
+/// arguments. Otherwise the patch carries only `additional_context`,
+/// which the hook layer surfaces via `HookOutput::allow_with_warning`.
+fn build_warn_modify(
+    channel: Channel,
+    tool_name: &str,
+    tool_input: Option<&serde_json::Value>,
+    normalized: f64,
+) -> Decision {
+    let warning = format!(
+        "{} pressure at {:.0}% of critical (warn zone). {}",
+        channel.name(),
+        normalized * 100.0,
+        warn_guidance(channel, tool_name),
+    );
+
+    let updated_input = tool_input.and_then(|input| patch_for(channel, tool_name, input));
+
+    Decision::Modify {
+        reason: warning.clone(),
+        patch: ToolPatch {
+            updated_input,
+            additional_context: Some(warning),
+        },
+    }
+}
+
+/// Construct a conservatively-patched copy of `tool_input` for known
+/// (channel, tool_name) pairs. Returns `None` if there's no patch
+/// recipe for this combination — in which case the Modify verdict will
+/// rely on `additional_context` alone to surface the warning.
+///
+/// The recipes only narrow scope; they never widen it. If the agent
+/// already specified a more conservative bound (e.g., `limit: 50`
+/// when the cap is 200), the existing bound is preserved.
+fn patch_for(
+    channel: Channel,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match (channel, tool_name) {
+        // Context pressure → narrow Read scope to first 200 lines.
+        (Channel::Context, "Read") => {
+            let mut patched = tool_input.clone();
+            cap_or_set_u64(&mut patched, "limit", 200);
+            ensure_field_u64(&mut patched, "offset", 0);
+            Some(patched)
+        }
+        // Context pressure → cap Grep output at 50 lines.
+        (Channel::Context, "Grep") => {
+            let mut patched = tool_input.clone();
+            cap_or_set_u64(&mut patched, "head_limit", 50);
+            Some(patched)
+        }
+        // Latency pressure → cap Bash timeout at 30s to fail fast.
+        (Channel::Latency, "Bash") => {
+            let mut patched = tool_input.clone();
+            cap_or_set_u64(&mut patched, "timeout", 30_000);
+            Some(patched)
+        }
+        // No recipe — Modify will fall back to additional_context only.
+        _ => None,
+    }
+}
+
+/// Set a non-negative integer field on a JSON object, but only widen
+/// the constraint when no value exists or when the existing value is
+/// looser than `cap`. If the existing value is already at or below
+/// `cap`, leave it alone — the agent's constraint is more restrictive
+/// than ours and we don't want to override it.
+fn cap_or_set_u64(input: &mut serde_json::Value, field: &str, cap: u64) {
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+    let needs_cap = match obj.get(field).and_then(|v| v.as_u64()) {
+        Some(existing) => existing > cap,
+        None => true,
+    };
+    if needs_cap {
+        obj.insert(field.to_string(), serde_json::json!(cap));
+    }
+}
+
+/// Insert a default value for a field iff the field is absent.
+/// Used for `offset: 0` so a Read patch always has both bounds set.
+fn ensure_field_u64(input: &mut serde_json::Value, field: &str, default: u64) {
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key(field) {
+        obj.insert(field.to_string(), serde_json::json!(default));
+    }
+}
+
+/// Channel-specific guidance for the warn-zone tier. Mirrors
+/// `deny_guidance` but with softer language and concrete suggestions
+/// the agent can act on without abandoning the call entirely.
+fn warn_guidance(channel: Channel, tool_name: &str) -> String {
+    match channel {
+        Channel::Context => format!(
+            "Context is filling up — narrowing the scope of '{}'. \
+             Consider summarizing what you've already learned before \
+             reading more files.",
+            tool_name
+        ),
+        Channel::Latency => format!(
+            "Recent calls have been slow — capping the timeout on '{}'. \
+             Consider whether the operation is necessary or could be \
+             replaced with something cheaper.",
+            tool_name
+        ),
+        Channel::Error => format!(
+            "Unresolved errors are accumulating. Consider focusing on \
+             fixing the existing errors before invoking '{}'.",
+            tool_name
+        ),
+        Channel::Repetition => format!(
+            "You've repeated similar tool calls recently. Consider \
+             whether '{}' is the right next step or if a different \
+             approach would make more progress.",
+            tool_name
+        ),
+        Channel::Progress => format!(
+            "Forward progress is stalling. Consider breaking the task \
+             into smaller pieces before invoking '{}'.",
+            tool_name
+        ),
+    }
 }
 
 /// Generate channel-specific guidance when denying a tool call.
@@ -140,6 +303,23 @@ fn deny_guidance(channel: Channel, tool_name: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Build a snapshot with one channel held at the given fraction
+    /// of its critical threshold and everything else at zero. Used by
+    /// the warn-zone tests to land precisely in the warn band without
+    /// accidentally triggering deny on a different channel.
+    fn snapshot_with_channel_at(channel: Channel, fraction: f64) -> PressureSnapshot {
+        let cfg = crate::channels::FeedbackConfig::from_defaults();
+        let criticals = cfg.system.criticals();
+        let mut values = vec![0.0; Channel::DIM];
+        values[channel.index()] = criticals[channel.index()] * fraction;
+        PressureSnapshot {
+            values,
+            composite_stress: fraction,
+            spectral_gap: 0.5,
+            is_stable: true,
+        }
+    }
+
     #[test]
     fn allow_when_all_channels_low() {
         let snapshot = PressureSnapshot {
@@ -149,7 +329,7 @@ mod tests {
             is_stable: true,
         };
         let thresholds = ChannelThresholds::default();
-        let decision = evaluate_decision(&snapshot, &thresholds, "Read");
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", None);
         assert!(matches!(decision, Decision::Allow));
     }
 
@@ -162,27 +342,170 @@ mod tests {
             is_stable: false,
         };
         let thresholds = ChannelThresholds::default();
-        let decision = evaluate_decision(&snapshot, &thresholds, "Read");
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", None);
         assert!(matches!(decision, Decision::Deny { .. }));
     }
 
     #[test]
     fn deny_when_channel_exceeds_threshold() {
+        // Push error channel to 90% of critical (above 85% deny threshold).
+        let snapshot = snapshot_with_channel_at(Channel::Error, 0.90);
+        let thresholds = ChannelThresholds::default();
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", None);
+        assert!(matches!(decision, Decision::Deny { .. }));
+    }
+
+    // ── Warn-zone tier (Decision::Modify) ──────────────────────────
+
+    #[test]
+    fn warn_zone_with_no_tool_input_returns_modify_with_only_context() {
+        // Error channel at 70% of critical lands in the warn band
+        // (warn=0.60, deny=0.85). With tool_input=None, the Modify
+        // verdict must carry only additional_context, not updated_input.
+        let snapshot = snapshot_with_channel_at(Channel::Error, 0.70);
+        let thresholds = ChannelThresholds::default();
+        let decision = evaluate_decision(&snapshot, &thresholds, "Bash", None);
+        match decision {
+            Decision::Modify { reason, patch } => {
+                assert!(reason.contains("error"), "reason should mention channel: {reason}");
+                assert!(reason.contains("warn zone"), "reason should mark the tier: {reason}");
+                assert!(patch.updated_input.is_none(), "no input → no patched input");
+                assert!(patch.additional_context.is_some(), "warning text must be present");
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_zone_context_pressure_caps_read_limit() {
+        // Context channel at 70% of critical, agent calling Read with
+        // no offset/limit. Patched input must add `limit: 200` and
+        // `offset: 0`, preserving file_path.
+        let snapshot = snapshot_with_channel_at(Channel::Context, 0.70);
+        let thresholds = ChannelThresholds::default();
+        let tool_input = serde_json::json!({"file_path": "/foo/bar.rs"});
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", Some(&tool_input));
+        match decision {
+            Decision::Modify { patch, .. } => {
+                let updated = patch.updated_input.expect("Read patch must produce updated_input");
+                assert_eq!(updated["file_path"], "/foo/bar.rs", "file_path preserved");
+                assert_eq!(updated["limit"], 200, "limit capped to 200");
+                assert_eq!(updated["offset"], 0, "offset defaulted to 0");
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_zone_preserves_existing_tighter_constraint() {
+        // Agent already specified limit=50, which is more conservative
+        // than the cap of 200. The patch must NOT widen it.
+        let snapshot = snapshot_with_channel_at(Channel::Context, 0.70);
+        let thresholds = ChannelThresholds::default();
+        let tool_input = serde_json::json!({"file_path": "/foo/bar.rs", "limit": 50});
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", Some(&tool_input));
+        match decision {
+            Decision::Modify { patch, .. } => {
+                let updated = patch.updated_input.expect("must produce updated_input");
+                assert_eq!(updated["limit"], 50, "existing tighter limit must be preserved");
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_zone_caps_existing_looser_constraint() {
+        // Agent specified limit=5000, which is looser than the cap.
+        // The patch must narrow it to 200.
+        let snapshot = snapshot_with_channel_at(Channel::Context, 0.70);
+        let thresholds = ChannelThresholds::default();
+        let tool_input = serde_json::json!({"file_path": "/foo/bar.rs", "limit": 5000});
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", Some(&tool_input));
+        match decision {
+            Decision::Modify { patch, .. } => {
+                let updated = patch.updated_input.expect("must produce updated_input");
+                assert_eq!(updated["limit"], 200, "loose limit must be narrowed to cap");
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_zone_latency_pressure_caps_bash_timeout() {
+        // Latency at 65% of critical, calling Bash with no timeout.
+        // Patched input must add `timeout: 30000`.
+        let snapshot = snapshot_with_channel_at(Channel::Latency, 0.65);
+        let thresholds = ChannelThresholds::default();
+        let tool_input = serde_json::json!({"command": "cargo build"});
+        let decision = evaluate_decision(&snapshot, &thresholds, "Bash", Some(&tool_input));
+        match decision {
+            Decision::Modify { patch, .. } => {
+                let updated = patch.updated_input.expect("must produce updated_input");
+                assert_eq!(updated["command"], "cargo build", "command preserved");
+                assert_eq!(updated["timeout"], 30_000, "timeout capped to 30s");
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_zone_grep_caps_head_limit() {
+        let snapshot = snapshot_with_channel_at(Channel::Context, 0.70);
+        let thresholds = ChannelThresholds::default();
+        let tool_input = serde_json::json!({"pattern": "TODO"});
+        let decision = evaluate_decision(&snapshot, &thresholds, "Grep", Some(&tool_input));
+        match decision {
+            Decision::Modify { patch, .. } => {
+                let updated = patch.updated_input.expect("must produce updated_input");
+                assert_eq!(updated["pattern"], "TODO", "pattern preserved");
+                assert_eq!(updated["head_limit"], 50, "head_limit capped to 50");
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn warn_zone_unknown_tool_falls_back_to_context_only() {
+        // Channel pressure in warn zone but the (channel, tool_name)
+        // pair has no patch recipe. The Modify verdict must still fire
+        // (the warning is valuable) but without an updated_input.
+        let snapshot = snapshot_with_channel_at(Channel::Context, 0.70);
+        let thresholds = ChannelThresholds::default();
+        let tool_input = serde_json::json!({"some": "thing"});
+        let decision =
+            evaluate_decision(&snapshot, &thresholds, "WeirdCustomTool", Some(&tool_input));
+        match decision {
+            Decision::Modify { patch, reason } => {
+                assert!(patch.updated_input.is_none(), "no recipe → no patched input");
+                assert!(patch.additional_context.is_some());
+                assert!(reason.contains("context"), "reason mentions channel: {reason}");
+            }
+            other => panic!("expected Modify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deny_takes_priority_over_warn() {
+        // Error at 90% (deny zone) AND context at 70% (warn zone).
+        // Deny must win.
         let cfg = crate::channels::FeedbackConfig::from_defaults();
         let criticals = cfg.system.criticals();
-
-        // Push error channel to 90% of critical (above 85% deny threshold)
         let mut values = vec![0.0; Channel::DIM];
+        values[Channel::Context.index()] = criticals[Channel::Context.index()] * 0.70;
         values[Channel::Error.index()] = criticals[Channel::Error.index()] * 0.90;
-
         let snapshot = PressureSnapshot {
             values,
-            composite_stress: 0.5,
+            composite_stress: 0.85,
             spectral_gap: 0.5,
             is_stable: true,
         };
         let thresholds = ChannelThresholds::default();
-        let decision = evaluate_decision(&snapshot, &thresholds, "Read");
-        assert!(matches!(decision, Decision::Deny { .. }));
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", None);
+        match decision {
+            Decision::Deny { reason } => {
+                assert!(reason.contains("error"), "deny must surface error, not context: {reason}");
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
     }
 }

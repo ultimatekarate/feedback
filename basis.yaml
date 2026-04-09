@@ -64,11 +64,12 @@ layers:
     depends_on: [dictionary, stability-analysis, linear-algebra, serialization, rust-internal]
 
   hands:
-    role: "IO-dependent. Real-time governor, Claude Code hook integration, session logging."
+    role: "IO-dependent. Real-time governor, Claude Code hook integration, session logging, hook binary."
     packages:
       - "src/governor"
       - "src/hooks"
       - "src/session"
+      - "src/bin"
     rules:
       purity: relaxed
       io: allowed
