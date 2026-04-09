@@ -6,13 +6,16 @@
 use serde::{Deserialize, Serialize};
 use volterra_stability::config::{ChannelConfig, SystemConfig};
 
-/// The six pressure channels of an agentic workflow.
+/// The five pressure channels of an agentic workflow.
+///
+/// Cost is tracked as a standalone metric (cumulative dollar spend),
+/// not a pressure channel. It's redundant with every other channel —
+/// every tool call fires cost AND at least one other channel — and its
+/// near-zero decay rate distorts spectral analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Channel {
     /// Token accumulation in the context window.
     Context,
-    /// Cumulative API spend. Monotonic — no natural decay.
-    Cost,
     /// Response time per interaction.
     Latency,
     /// Unresolved failure count (compile errors, test failures, tool failures).
@@ -25,12 +28,11 @@ pub enum Channel {
 
 impl Channel {
     /// Total number of pressure channels.
-    pub const DIM: usize = 6;
+    pub const DIM: usize = 5;
 
     /// All channels in index order.
-    pub const ALL: [Channel; 6] = [
+    pub const ALL: [Channel; 5] = [
         Channel::Context,
-        Channel::Cost,
         Channel::Latency,
         Channel::Error,
         Channel::Progress,
@@ -41,11 +43,10 @@ impl Channel {
     pub fn index(self) -> usize {
         match self {
             Channel::Context => 0,
-            Channel::Cost => 1,
-            Channel::Latency => 2,
-            Channel::Error => 3,
-            Channel::Progress => 4,
-            Channel::Repetition => 5,
+            Channel::Latency => 1,
+            Channel::Error => 2,
+            Channel::Progress => 3,
+            Channel::Repetition => 4,
         }
     }
 
@@ -53,7 +54,6 @@ impl Channel {
     pub fn name(self) -> &'static str {
         match self {
             Channel::Context => "context",
-            Channel::Cost => "cost",
             Channel::Latency => "latency",
             Channel::Error => "error",
             Channel::Progress => "progress",
@@ -78,9 +78,9 @@ pub struct ChannelThresholds {
 impl Default for ChannelThresholds {
     fn default() -> Self {
         Self {
-            // Warn at 60% of critical, deny at 85%
-            warn: vec![0.60, 0.60, 0.60, 0.60, 0.60, 0.60],
-            deny: vec![0.85, 0.85, 0.85, 0.85, 0.85, 0.85],
+            // Warn at 60% of critical, deny at 85%.
+            warn: vec![0.60, 0.60, 0.60, 0.60, 0.60],
+            deny: vec![0.85, 0.85, 0.85, 0.85, 0.85],
         }
     }
 }
@@ -95,7 +95,7 @@ pub struct FeedbackConfig {
 }
 
 impl FeedbackConfig {
-    /// Default 6-channel configuration calibrated from empirical session data.
+    /// Default 5-channel configuration calibrated from empirical session data.
     ///
     /// Calibration source: three honeypot sessions (Phase 0).
     ///   v1 bug-fix: 38 calls / 5 min / healthy → peaks at ~30%
@@ -109,6 +109,10 @@ impl FeedbackConfig {
     /// Critical thresholds are set so healthy sessions peak at ~30% and
     /// struggling sessions cross the 60% warn threshold on the channels
     /// that distinguish them.
+    ///
+    /// Cost is tracked as a standalone metric in the Governor, not as a
+    /// pressure channel. It's redundant (every tool call fires cost AND
+    /// another channel) and its near-zero lambda distorts spectral analysis.
     pub fn from_defaults() -> Self {
         let channels = vec![
             ChannelConfig {
@@ -123,17 +127,6 @@ impl FeedbackConfig {
                 // Grep/Glob=100, Agent=4400. Healthy sessions peak at
                 // ~11K-12K token-units. 4x healthy peak = 50K.
                 critical: 50_000.0,
-            },
-            ChannelConfig {
-                name: "cost".into(),
-                // Cost is monotonic — dollars don't un-spend. Lambda exists
-                // only for Jacobian stability (nonzero eigenvalue). Constraint:
-                // retain >95% of value over a 30-min session.
-                // exp(-lambda * 1800) > 0.95 → lambda < 0.0000285
-                // lambda = ln(2)/23100 ≈ 0.00003. Half-life ~6.4 hours.
-                lambda: 0.00003,
-                // 0.005 per call × ~120 calls = 0.60. Session budget threshold.
-                critical: 0.60,
             },
             ChannelConfig {
                 name: "latency".into(),
@@ -184,13 +177,13 @@ impl FeedbackConfig {
             },
         ];
 
+        // Weights redistributed proportionally after removing cost (was 0.10).
         let stress_weights = vec![
-            0.25, // context — high weight, non-renewable resource
-            0.10, // cost — lower weight, monitored but not primary
-            0.10, // latency — informational
-            0.30, // error — highest weight, errors drive cascades
-            0.15, // progress — stalls waste tokens
-            0.10, // repetition — indicator of thrashing
+            0.28, // context — high weight, non-renewable resource
+            0.11, // latency — informational
+            0.33, // error — highest weight, errors drive cascades
+            0.17, // progress — stalls waste tokens
+            0.11, // repetition — indicator of thrashing
         ];
 
         Self {
@@ -208,7 +201,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_has_six_channels() {
+    fn default_config_has_five_channels() {
         let cfg = FeedbackConfig::from_defaults();
         assert_eq!(cfg.system.dim(), Channel::DIM);
     }

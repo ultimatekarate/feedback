@@ -11,13 +11,13 @@
 //! | Channel    | Exclusive source                                    |
 //! |------------|-----------------------------------------------------|
 //! | Context    | Estimated token load from tool I/O payload           |
-//! | Cost       | Per-call spend tax (the only universal impulse)      |
 //! | Latency    | Wall-clock time waiting for Bash commands             |
 //! | Error      | Tool failures + parsed test/build failures (PostTool)|
 //! | Progress   | Time-proportional stall minus productive actions     |
 //! | Repetition | 2nd+ access to the same file path                   |
 //!
-//! No single impulse fires on all channels simultaneously.
+//! Cost is tracked as a standalone metric (cumulative dollar spend) in
+//! the Governor, not as a pressure channel.
 
 use crate::channels::Channel;
 use crate::decision::Decision;
@@ -46,12 +46,17 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    // Plan docs (.claude/plans/) are designed for iterative review.
+    // Suppress repetition impulses for plan file accesses.
+    let is_plan_file = file_path.contains(".claude/plans")
+        || file_path.contains(".claude\\plans");
+
     match tool {
         "Read" => {
             // Context: measured median 1175 tokens (range 289-8032).
             governor.record_impulse(Channel::Context, 1175.0);
-            // Repetition: only on revisit.
-            if !file_path.is_empty() {
+            // Repetition: only on revisit (plan docs excluded).
+            if !file_path.is_empty() && !is_plan_file {
                 let count = governor.record_file_access(file_path);
                 if count > 1 {
                     governor.record_impulse(Channel::Repetition, 1.0);
@@ -73,8 +78,8 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
             governor.record_impulse(Channel::Context, 200.0);
             // Progress: forward motion.
             governor.record_impulse(Channel::Progress, -3.0);
-            // Repetition: only on revisit.
-            if !file_path.is_empty() {
+            // Repetition: only on revisit (plan docs excluded).
+            if !file_path.is_empty() && !is_plan_file {
                 let count = governor.record_file_access(file_path);
                 if count > 1 {
                     governor.record_impulse(Channel::Repetition, 0.5);
@@ -104,7 +109,18 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
             // Context: measured 4384 tokens (n=1).
             governor.record_impulse(Channel::Context, 4400.0);
             // Cost: agent surcharge (on top of per-call tax below).
-            governor.record_impulse(Channel::Cost, 0.05);
+            governor.record_cost(0.05);
+        }
+        "ExitPlanMode" => {
+            // Planning credit: deliberate plan review is productive work.
+            // At PreToolUse we don't know if approved or rejected, so
+            // apply a conservative credit. Each review round refines the
+            // plan toward zero-error implementation.
+            governor.record_impulse(Channel::Progress, -2.0);
+        }
+        "TodoWrite" => {
+            // Task tracking is lightweight forward motion.
+            governor.record_impulse(Channel::Progress, -0.5);
         }
         _ => {
             // Unknown tool: conservative default.
@@ -112,9 +128,9 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
         }
     }
 
-    // ── Cost: the ONLY universal per-call impulse ──────────────
-    // No other channel fires on every tool call.
-    governor.record_impulse(Channel::Cost, 0.005);
+    // ── Cost metric: per-call spend tax ─────────────────────────
+    // Cost is a standalone metric, not a pressure channel.
+    governor.record_cost(0.005);
 
     // Note: Error channel is NOT populated here. PreToolUse fires
     // BEFORE the tool runs, so we cannot see errors or parse output.
@@ -242,39 +258,30 @@ mod tests {
     }
 
     #[test]
-    fn cost_is_only_universal_impulse() {
-        // Every tool type should produce a cost impulse.
-        // No other single channel should be present in ALL tool types.
-        let tools = vec![
-            ("Read", serde_json::json!({"file_path": "/a.rs"})),
-            ("Write", serde_json::json!({"file_path": "/b.rs", "content": "x"})),
-            ("Edit", serde_json::json!({"file_path": "/c.rs", "old_string": "a", "new_string": "b"})),
-            ("Bash", serde_json::json!({"command": "echo hi"})),
-            ("Grep", serde_json::json!({"pattern": "foo"})),
-            ("Glob", serde_json::json!({"pattern": "*.rs"})),
-            ("Agent", serde_json::json!({"prompt": "do stuff"})),
-        ];
-        for (tool, input_val) in &tools {
-            let mut gov = Governor::from_defaults();
-            let input = make_input(tool, input_val.clone());
-            apply_impulses(&input, &mut gov);
-            let vals = gov.current_values();
-            assert!(
-                vals[Channel::Cost.index()] > 0.0,
-                "{} should produce cost impulse",
-                tool
-            );
-        }
+    fn cost_metric_accumulates() {
+        // Every tool type should accumulate cost as a standalone metric.
+        let mut gov = Governor::from_defaults();
+        let input = make_input("Read", serde_json::json!({"file_path": "/a.rs"}));
+        apply_impulses(&input, &mut gov);
+        assert!(
+            gov.cumulative_cost() > 0.0,
+            "cost metric should accumulate"
+        );
+        let first = gov.cumulative_cost();
+        apply_impulses(&input, &mut gov);
+        assert!(
+            gov.cumulative_cost() > first,
+            "cost metric should grow with each call"
+        );
     }
 
     #[test]
-    fn grep_glob_only_context_and_cost() {
+    fn grep_glob_only_context() {
         let mut gov = Governor::from_defaults();
         let input = make_input("Grep", serde_json::json!({"pattern": "foo"}));
         apply_impulses(&input, &mut gov);
         let vals = gov.current_values();
         assert!(vals[Channel::Context.index()] > 0.0);
-        assert!(vals[Channel::Cost.index()] > 0.0);
         // All other channels should be near-zero (only progress stall from dt≈0)
         assert!(vals[Channel::Latency.index()] < 0.01);
         assert!(vals[Channel::Error.index()] < 0.01);

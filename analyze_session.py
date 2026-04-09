@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Feedback pressure analysis -- replay a Claude Code session JSONL through the 6-channel model.
+"""Feedback pressure analysis -- replay a Claude Code session JSONL through the 5-channel model.
 
 Orthogonal channel design: each channel has a unique impulse source.
   Context    -- token load from tool I/O payload size
-  Cost       -- per-call spend tax (the only universal impulse)
   Latency    -- wall-clock time waiting for Bash commands
   Error      -- tool failures + parsed test/build failure patterns
   Progress   -- time-proportional stall minus productive actions
   Repetition -- 2nd+ access to the same file path
+
+Cost is tracked as a standalone metric (cumulative dollar spend), not
+a pressure channel. It's redundant with every other channel and its
+near-zero decay rate distorts spectral analysis.
 
 Impulse mapping synced with feedback/src/hooks.rs.
 Channel parameters synced with feedback/src/channels.rs.
@@ -42,7 +45,6 @@ class DecayingIntegral:
 
 LAMBDAS = {
     'context':    0.0019,     # half-life 6.1 min (working set inter-reference time)
-    'cost':       0.00003,    # half-life 6.4 hr  (monotonic; retain >95% over session)
     'latency':    0.0053,     # half-life 130s    (EWMA over ~15 tool calls)
     'error':      0.0029,     # half-life 4.0 min (fix cycle duration)
     'progress':   0.0018,     # half-life 6.3 min (base_rate / critical steady-state)
@@ -57,12 +59,15 @@ CRITICALS = {
     # Impulses are physical quantities (tokens, seconds, counts).
     # Criticals are the integral value where sustained behavior is genuinely bad.
     'context':    50_000.0,   # tokens: 4x healthy peak (~12K). Rapid context churn.
-    'cost':       0.60,       # ~120 tool calls before concern. Session budget.
     'latency':    350.0,      # seconds: sustained 2-min Bash calls. Catastrophic builds.
     'error':      6.0,        # 6 active errors in decay window = sustained failure loop.
     'progress':   55.0,       # pure stall steady-state = 0.1/0.0018 = 55.6. Agent produces nothing.
     'repetition': 15.0,       # 15 active re-accesses = thrashing same files every few seconds.
 }
+
+# Cost: standalone metric, not a pressure channel.
+COST_PER_CALL = 0.005    # base per-call tax
+COST_AGENT_SURCHARGE = 0.05  # additional cost for Agent tool calls
 
 PROGRESS_BASE_RATE = 0.1  # stall accumulation: 0.1 per second between calls
 
@@ -105,12 +110,14 @@ def build_timeline(events):
                 inp = block.get('input', {})
                 fpath = inp.get('file_path', '')
                 sep = chr(92)
-                fname = fpath.replace(sep, '/').split('/')[-1] if fpath else ''
+                fpath_normalized = fpath.replace(sep, '/')
+                fname = fpath_normalized.split('/')[-1] if fpath else ''
                 timeline.append({
                     'dt': dt, 'kind': 'call',
                     'tool': block.get('name', ''),
                     'id': block.get('id', ''),
                     'file': fname,
+                    'fpath': fpath_normalized,
                     'command': inp.get('command', '')[:200] if 'command' in inp else '',
                 })
             elif block.get('type') == 'tool_result':
@@ -137,6 +144,7 @@ def build_timeline(events):
 
 def simulate(timeline):
     channels = {name: DecayingIntegral(lam) for name, lam in LAMBDAS.items()}
+    cumulative_cost = 0.0  # standalone metric, not a pressure channel
     file_access_count = defaultdict(int)
     t0 = timeline[0]['dt']
     error_events = []
@@ -157,12 +165,19 @@ def simulate(timeline):
             tool = ev['tool']
             fname = ev.get('file', '')
             cmd = ev.get('command', '')
-            call_info[ev.get('id', '')] = {'tool': tool, 't': t, 'cmd': cmd}
+            fpath_full = ev.get('fpath', '')
+            call_info[ev.get('id', '')] = {'tool': tool, 't': t, 'cmd': cmd, 'fpath': fpath_full}
 
             # -- Progress: time-proportional stall accumulation --
+            # Cap inter-call gap at 10 minutes. Gaps longer than that are
+            # session suspensions (overnight, lunch), not stalls. Without
+            # the cap, a 19-hour overnight gap deposits ~5700 stall-units
+            # and progress hits 10,000%+ — pure noise.
+            MAX_STALL_GAP = 600.0  # 10 minutes
             dt_since_last = t - last_call_t
-            if dt_since_last > 0:
-                channels['progress'].record(dt_since_last * PROGRESS_BASE_RATE, t)
+            stall_dt = min(dt_since_last, MAX_STALL_GAP)
+            if stall_dt > 0:
+                channels['progress'].record(stall_dt * PROGRESS_BASE_RATE, t)
             last_call_t = t
 
             # -- Orthogonal impulse mapping ---
@@ -172,7 +187,10 @@ def simulate(timeline):
                 channels['context'].record(1175.0, t)   # measured median: 1175 tokens
                 if fname:
                     file_access_count[fname] += 1
-                    if file_access_count[fname] > 1:
+                    # Plan docs are designed for iterative review.
+                    # Suppress repetition for .claude/plans/ paths.
+                    is_plan = '.claude/plans' in fpath_full
+                    if file_access_count[fname] > 1 and not is_plan:
                         channels['repetition'].record(1.0, t)
 
             elif tool in ('Glob', 'Grep'):
@@ -187,7 +205,8 @@ def simulate(timeline):
                 channels['progress'].record(-3.0, t)
                 if fname:
                     file_access_count[fname] += 1
-                    if file_access_count[fname] > 1:
+                    is_plan = '.claude/plans' in fpath_full
+                    if file_access_count[fname] > 1 and not is_plan:
                         channels['repetition'].record(0.5, t)
 
             elif tool == 'Bash':
@@ -202,13 +221,21 @@ def simulate(timeline):
 
             elif tool == 'Agent':
                 channels['context'].record(4400.0, t)    # measured: 4384 tokens
-                channels['cost'].record(0.05, t)
+                cumulative_cost += COST_AGENT_SURCHARGE
+
+            elif tool == 'TodoWrite':
+                # Task tracking is lightweight forward motion.
+                channels['progress'].record(-0.5, t)
+
+            elif tool == 'ExitPlanMode':
+                # Planning credit applied in result handler (approval vs review).
+                pass
 
             else:
                 channels['context'].record(200.0, t)     # conservative default
 
-            # Cost: the ONLY universal per-call impulse.
-            channels['cost'].record(0.005, t)
+            # Cost metric: per-call spend tax.
+            cumulative_cost += COST_PER_CALL
 
         elif ev['kind'] == 'result':
             call_id = ev.get('id', '')
@@ -223,8 +250,20 @@ def simulate(timeline):
                 if elapsed > 0:
                     channels['latency'].record(elapsed, t)
 
+            # Progress credit: planning rounds with user feedback.
+            # ExitPlanMode with user direction ("red team", "check for",
+            # "does it adhere") is productive work, not stalling.
+            # Approved plans get a larger credit (forward motion achieved).
+            if correlated_tool == 'ExitPlanMode':
+                result_text_plan = ev.get('content', '')
+                if 'approved' in result_text_plan.lower():
+                    channels['progress'].record(-5.0, t)  # plan landed
+                elif not ev.get('is_error'):
+                    channels['progress'].record(-2.0, t)  # review round
+
             # Error channel: tool errors.
-            if ev.get('is_error'):
+            # ExitPlanMode rejections are user steering, not failures.
+            if ev.get('is_error') and correlated_tool != 'ExitPlanMode':
                 channels['error'].record(1.0, t)
                 error_events.append({'t': t, 'dt': ev['dt']})
 
@@ -239,17 +278,17 @@ def simulate(timeline):
         if t - last_snapshot >= 30:
             for ch in channels.values():
                 ch.update(t)
-            snap = {'t': t, 'dt': ev['dt']}
+            snap = {'t': t, 'dt': ev['dt'], 'cost': cumulative_cost}
             for name, ch in channels.items():
                 snap[name] = ch.value
                 snap[name + '_pct'] = max(0.0, (ch.value / CRITICALS[name]) * 100)
             snapshots.append(snap)
             last_snapshot = t
 
-    return channels, file_access_count, error_events, snapshots
+    return channels, cumulative_cost, file_access_count, error_events, snapshots
 
 
-def report(timeline, channels, file_access_count, error_events, snapshots):
+def report(timeline, channels, cumulative_cost, file_access_count, error_events, snapshots):
     t0 = timeline[0]['dt']
     t_end = timeline[-1]['dt']
     duration_s = (t_end - t0).total_seconds()
@@ -358,27 +397,66 @@ def report(timeline, channels, file_access_count, error_events, snapshots):
         pct = max(0.0, (ch.value / CRITICALS[name]) * 100)
         warn = ' ** WARN' if pct > 60 else (' * elevated' if pct > 40 else '')
         print(f"  {name:12s}: {ch.value:8.2f} / {CRITICALS[name]:8.2f}  ({pct:.1f}%){warn}")
+    print(f"  {'cost':12s}: ${cumulative_cost:.3f}  (metric only, not a pressure channel)")
 
-    # Stability assessment
+    # Stability assessment with intervention breakdown
     print()
     print("-- STABILITY ASSESSMENT --")
     warn_count = 0
     deny_count = 0
+    # Track which channel triggered each deny, and when.
+    deny_triggers = []  # (time_str, channel, pct)
+    deny_by_channel = Counter()
+    warn_by_channel = Counter()
+
     for s in snapshots:
         for name in LAMBDAS:
             pct = s[name + '_pct']
             if pct > 85:
                 deny_count += 1
+                deny_by_channel[name] += 1
+                t_min = s['t'] / 60
+                deny_triggers.append((t_min, name, pct))
             elif pct > 60:
                 warn_count += 1
+                warn_by_channel[name] += 1
+
     print(f"  Snapshots where a channel exceeded WARN (60%): {warn_count}")
     print(f"  Snapshots where a channel exceeded DENY (85%): {deny_count}")
+
     if deny_count == 0 and warn_count == 0:
         print("  -> Session remained well within stable operating envelope.")
     elif deny_count == 0:
         print(f"  -> Governor would have warned {warn_count} times. No denials.")
     else:
         print(f"  -> Governor would have intervened {deny_count} times.")
+
+    if deny_by_channel:
+        print()
+        print("-- INTERVENTION BREAKDOWN --")
+        print("  Denials by channel:")
+        for name, count in deny_by_channel.most_common():
+            print(f"    {name:12s}: {count:2d}")
+        if warn_by_channel:
+            print("  Warnings by channel:")
+            for name, count in warn_by_channel.most_common():
+                print(f"    {name:12s}: {count:2d}")
+
+        # Cluster denials by time to show when interventions fired.
+        # Group denials that fire within the same 30s snapshot.
+        print()
+        print("  Intervention timeline:")
+        i = 0
+        while i < len(deny_triggers):
+            t_min, ch, pct = deny_triggers[i]
+            # Gather all denials at the same timestamp (same snapshot).
+            batch = [(ch, pct)]
+            while i + 1 < len(deny_triggers) and abs(deny_triggers[i + 1][0] - t_min) < 0.1:
+                i += 1
+                batch.append((deny_triggers[i][1], deny_triggers[i][2]))
+            channels_str = ', '.join(f'{c}={p:.0f}%' for c, p in batch)
+            print(f"    {int(t_min):3d}:{int((t_min % 1) * 60):02d}  DENY  {channels_str}")
+            i += 1
 
 
 if __name__ == '__main__':
@@ -388,5 +466,5 @@ if __name__ == '__main__':
     if not timeline:
         print("No events found.")
         sys.exit(1)
-    channels, fac, errs, snaps = simulate(timeline)
-    report(timeline, channels, fac, errs, snaps)
+    channels, cost, fac, errs, snaps = simulate(timeline)
+    report(timeline, channels, cost, fac, errs, snaps)

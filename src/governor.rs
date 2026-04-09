@@ -30,6 +30,9 @@ pub struct Governor {
     /// Timestamp of the last tool call (seconds since epoch).
     /// Used for time-proportional progress accumulation.
     last_call_t: f64,
+    /// Cumulative session cost in dollars. Standalone metric — not a
+    /// pressure channel. Tracked for display and budget reporting only.
+    cumulative_cost: f64,
 }
 
 impl Governor {
@@ -48,6 +51,7 @@ impl Governor {
             epoch: Instant::now(),
             file_access_counts: HashMap::new(),
             last_call_t: 0.0,
+            cumulative_cost: 0.0,
         }
     }
 
@@ -58,7 +62,6 @@ impl Governor {
         // Rates are in channel-units per second at ~1 call every 8s.
         let rates = ImpulseRates::from_slice(&[
             50.0,  // context: ~400 tokens/call / 8s (measured)
-            0.001, // cost: 0.005 per call / 8s + overhead
             0.38,  // latency: ~3s per Bash, ~1 Bash per 8 calls
             0.01,  // error: ~2 errors per 300s session
             0.1,   // progress: 0.1/s base stall rate
@@ -70,6 +73,18 @@ impl Governor {
     /// Current time in seconds since governor creation.
     fn now(&self) -> f64 {
         self.epoch.elapsed().as_secs_f64()
+    }
+
+    /// Record a cost increment. Cost is a standalone metric (cumulative
+    /// dollar spend), not a pressure channel. It does not participate in
+    /// the Jacobian, spectral analysis, or governor decisions.
+    pub fn record_cost(&mut self, amount: f64) {
+        self.cumulative_cost += amount;
+    }
+
+    /// Current cumulative session cost in dollars.
+    pub fn cumulative_cost(&self) -> f64 {
+        self.cumulative_cost
     }
 
     /// Record a pressure impulse on a specific channel.
@@ -97,13 +112,18 @@ impl Governor {
     /// tool call. Called at the start of each hook invocation. Returns
     /// the elapsed seconds since the previous call.
     pub fn accumulate_progress_stall(&mut self) -> f64 {
+        /// Gaps longer than 10 minutes are session suspensions
+        /// (overnight, lunch, context switch), not stalls.
+        const MAX_STALL_GAP: f64 = 600.0;
+
         let now = self.now();
         let dt = now - self.last_call_t;
-        if dt > 0.0 {
+        let stall_dt = if dt > MAX_STALL_GAP { MAX_STALL_GAP } else { dt };
+        if stall_dt > 0.0 {
             // 0.1 progress-units per second of elapsed time.
             // This is the base stall rate — productive actions
             // (Edit, Write) give negative impulses to counteract.
-            self.bank.record(Channel::Progress.index(), dt * 0.1, now);
+            self.bank.record(Channel::Progress.index(), stall_dt * 0.1, now);
         }
         self.last_call_t = now;
         dt

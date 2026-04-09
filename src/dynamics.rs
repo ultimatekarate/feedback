@@ -1,4 +1,4 @@
-//! NonlinearDynamics implementation for the 6-channel agentic pressure system.
+//! NonlinearDynamics implementation for the 5-channel agentic pressure system.
 //!
 //! Laboratory layer: pure math. Implements the full nonlinear right-hand side
 //! for offline simulation and Lyapunov exponent computation.
@@ -10,7 +10,7 @@ use volterra_stability::scaler::linear_scaler;
 
 use crate::channels::{Channel, FeedbackConfig};
 
-/// Full nonlinear dynamics of the 6-channel agentic pressure system.
+/// Full nonlinear dynamics of the 5-channel agentic pressure system.
 ///
 /// Unlike the linearized Jacobian (valid near one operating point), this
 /// captures the full saturation nonlinearities across the entire state space.
@@ -38,7 +38,6 @@ impl AgentDynamics {
         let sigma_err = linear_scaler(x[Channel::Error.index()], criticals[Channel::Error.index()]);
 
         let ctx = Channel::Context.index();
-        let cst = Channel::Cost.index();
         let lat = Channel::Latency.index();
         let err = Channel::Error.index();
         let prg = Channel::Progress.index();
@@ -52,8 +51,6 @@ impl AgentDynamics {
             self.rates.rates[ctx] * sigma_ctx
                 + self.rates.rates[ctx] * 0.5 * error_stress
                 + self.rates.rates[ctx] * 0.3 * (x[rep] / criticals[rep]).min(1.0),
-            // Cost: always accumulating proportional to context activity
-            self.rates.rates[cst] + self.rates.rates[cst] * 0.1 * (x[ctx] / criticals[ctx]).min(1.0),
             // Latency: base rate, weakly coupled
             self.rates.rates[lat],
             // Error: base rate + context-degradation coupling
@@ -101,7 +98,6 @@ mod tests {
         // Typical mix: ~3 Edit + 1 Read + 0.5 Bash per 8 calls → avg ~400 tok/call.
         let rates = ImpulseRates::from_slice(&[
             50.0,  // context: ~400 tokens/call / 8s
-            0.001, // cost: 0.005 per call / 8s + overhead
             0.38,  // latency: ~3s per Bash, ~1 Bash per 8 calls
             0.01,  // error: ~2 errors per 300s session
             0.1,   // progress: 0.1/s base stall rate
@@ -131,11 +127,10 @@ mod tests {
         let sys = test_dynamics();
         let mut x = DVector::zeros(Channel::DIM);
         let dt = 1.0;
-        // Evolve for a long time to approach equilibrium.
-        // Cost channel has lambda=0.00003 (half-life ~6.4 hours), so
-        // equilibrium requires simulating several half-lives.
-        // 100,000 steps at dt=1.0 = 100,000 simulated seconds ≈ 27 hours.
-        for _ in 0..100_000 {
+        // Evolve to approach equilibrium. Slowest channel is progress
+        // (lambda=0.0018, half-life ~6.3 min). 5,000 steps at dt=1.0
+        // = ~83 min ≈ 13 half-lives — more than sufficient.
+        for _ in 0..5_000 {
             x = rk4_step(&sys, 0.0, &x, dt);
         }
         // At equilibrium, rhs should be near zero

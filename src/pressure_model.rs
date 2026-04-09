@@ -1,4 +1,4 @@
-//! CouplingModel implementation for the 6-channel agentic pressure system.
+//! CouplingModel implementation for the 5-channel agentic pressure system.
 //!
 //! Laboratory layer: pure math. Encodes the coupling hypothesis —
 //! which channels affect which, and with what coefficients.
@@ -12,7 +12,7 @@ use crate::channels::{Channel, FeedbackConfig};
 
 /// The agentic workflow coupling model.
 ///
-/// Implements CouplingModel for the 6-channel pressure system.
+/// Implements CouplingModel for the 5-channel pressure system.
 /// The coupling coefficients encode the hypothesis about how agent
 /// pressure channels interact. These are tunable parameters that
 /// will be fitted from empirical session data.
@@ -40,7 +40,6 @@ impl CouplingModel for AgentCouplingModel {
         let criticals = cfg.criticals();
 
         let ctx = Channel::Context.index();
-        let _cst = Channel::Cost.index();
         let lat = Channel::Latency.index();
         let err = Channel::Error.index();
         let prg = Channel::Progress.index();
@@ -53,13 +52,6 @@ impl CouplingModel for AgentCouplingModel {
         }
 
         // --- Cross-coupling (the hypothesis) ---
-        //
-        // Cost is excluded from coupling. It's a monotonic budget
-        // constraint (lambda ≈ 0), not a dynamic pressure channel.
-        // Including it in the Jacobian would create a near-zero
-        // eigenvalue that distorts the spectral analysis. Cost is
-        // tracked by the IntegralBank for budget enforcement but
-        // doesn't participate in the stability dynamics.
 
         // Cross-coupling coefficients are normalized by the critical
         // threshold of the target channel to keep the Jacobian entries
@@ -121,7 +113,6 @@ mod tests {
         // Rates are in channel-units per second at ~1 call every 8s.
         ImpulseRates::from_slice(&[
             50.0,  // context: ~400 tokens/call / 8s
-            0.001, // cost: 0.005 per call / 8s + overhead
             0.38,  // latency: ~3s per Bash, ~1 Bash per 8 calls
             0.01,  // error: ~2 errors per 300s session
             0.1,   // progress: 0.1/s base stall rate

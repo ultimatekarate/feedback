@@ -89,10 +89,6 @@ pub fn evaluate_decision(
     }
 
     // Check spectral gap — if it's narrowing, warn.
-    // Note: the cost channel has near-zero lambda (monotonic accumulator),
-    // which produces a near-zero eigenvalue by design. The spectral gap
-    // threshold must account for this. We check the gap excluding the
-    // cost channel's contribution by using a very small threshold.
     if snapshot.spectral_gap < 1e-6 && snapshot.is_stable {
         return Decision::Deny {
             reason: format!(
@@ -130,11 +126,6 @@ fn deny_guidance(channel: Channel, tool_name: &str) -> String {
         Channel::Progress => {
             "No forward progress detected. Break the current task into \
              smaller steps or ask the user for clarification."
-                .into()
-        }
-        Channel::Cost => {
-            "Session cost budget is nearly exhausted. Complete only \
-             essential remaining work."
                 .into()
         }
         Channel::Latency => {
