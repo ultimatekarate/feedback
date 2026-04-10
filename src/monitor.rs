@@ -41,6 +41,7 @@ pub fn check_stability(
 
     PressureSnapshot {
         values: values.to_vec(),
+        prev_values: None, // populated by Governor after construction
         composite_stress: stress,
         spectral_gap: spectral.spectral_gap_gamma1,
         is_stable: stability.is_stable,
@@ -52,6 +53,14 @@ pub fn check_stability(
 /// Four levels of intervention, checked in order:
 /// 1. System spectrally unstable                       → Deny (cascading)
 /// 2. Any channel above its deny threshold             → Deny (channel-specific)
+///    **Exception: `Channel::Context` is never denied here.** Context
+///    pressure is handled by Claude Code's own auto-compactor, which
+///    summarises the transcript before the window actually fills; the
+///    governor's role on this channel is to surface guidance, not to
+///    block tool calls the agent needs in order to reach the point
+///    where Claude Code would have compacted anyway. The watchdog in
+///    `feedback-hook` catches the pathological "compaction thrashing"
+///    case out-of-band via `additionalContext` injection.
 /// 3. Spectral gap below 1e-6 (instability boundary)   → Deny (margin)
 /// 4. Any channel in the warn zone (warn < n ≤ deny)   → Modify
 ///    - If a tool-specific patch exists for the
@@ -62,6 +71,10 @@ pub fn check_stability(
 ///    - Otherwise the Modify carries only an
 ///      `additional_context` warning so the agent
 ///      sees the guidance even with no input patch.
+///    Context is also included at this tier — if its normalised value
+///    is anywhere above the warn threshold (including what would have
+///    been the deny zone), it produces a Modify with a Read/Grep
+///    narrowing patch instead of blocking the call.
 /// 5. Otherwise                                        → Allow
 ///
 /// `tool_input` is the raw JSON arguments the agent supplied for the
@@ -89,16 +102,28 @@ pub fn evaluate_decision(
         };
     }
 
-    // 2. Check per-channel deny thresholds
+    // 2. Check per-channel deny thresholds. Context is intentionally
+    //    excluded — see the docstring above. If Context crosses its
+    //    nominal deny threshold, it falls through to the warn-zone
+    //    loop below and becomes a Modify verdict with narrowing
+    //    patches, so the agent keeps making progress while the
+    //    auto-compactor takes care of the actual window pressure.
     for ch in Channel::ALL {
+        if ch == Channel::Context {
+            continue;
+        }
         let i = ch.index();
         let normalized = snapshot.values[i] / criticals[i];
         if normalized > thresholds.deny[i] {
+            let pct = normalized * 100.0;
+            let prev_pct = prev_normalized_pct(snapshot, ch);
+            let traj = trajectory_label(pct, prev_pct);
             return Decision::Deny {
                 reason: format!(
-                    "{} pressure at {:.0}% of critical. {}",
+                    "{} pressure at {:.0}% of critical{}. {}",
                     ch.name(),
-                    normalized * 100.0,
+                    pct,
+                    traj,
                     deny_guidance(ch, tool_name),
                 ),
             };
@@ -124,7 +149,7 @@ pub fn evaluate_decision(
         let i = ch.index();
         let normalized = snapshot.values[i] / criticals[i];
         if normalized > thresholds.warn[i] {
-            return build_warn_modify(ch, tool_name, tool_input, normalized);
+            return build_warn_modify(ch, tool_name, tool_input, normalized, snapshot);
         }
     }
 
@@ -144,11 +169,16 @@ fn build_warn_modify(
     tool_name: &str,
     tool_input: Option<&serde_json::Value>,
     normalized: f64,
+    snapshot: &PressureSnapshot,
 ) -> Decision {
+    let pct = normalized * 100.0;
+    let prev_pct = prev_normalized_pct(snapshot, channel);
+    let traj = trajectory_label(pct, prev_pct);
     let warning = format!(
-        "{} pressure at {:.0}% of critical (warn zone). {}",
+        "{} pressure at {:.0}% of critical{} (warn zone). {}",
         channel.name(),
-        normalized * 100.0,
+        pct,
+        traj,
         warn_guidance(channel, tool_name),
     );
 
@@ -266,13 +296,45 @@ fn warn_guidance(channel: Channel, tool_name: &str) -> String {
     }
 }
 
+/// Compute a trajectory label from current and previous normalized
+/// pressure. Returns " (falling)", " (rising)", " (stable)", or ""
+/// depending on whether the pressure is trending down, up, holding
+/// steady, or unknown (no previous value). Uses a 2% dead band so
+/// sub-unit fluctuations from decay don't flip the label.
+///
+/// The trajectory label helps the agent distinguish transient pressure
+/// (attrition through low-cost retries is viable) from escalating
+/// pressure (a genuine strategy change is needed).
+fn trajectory_label(current_pct: f64, prev_pct: Option<f64>) -> &'static str {
+    match prev_pct {
+        Some(prev) if current_pct < prev - 2.0 => " (falling)",
+        Some(prev) if current_pct > prev + 2.0 => " (rising)",
+        Some(_) => " (stable)",
+        None => "",
+    }
+}
+
+/// Compute the previous normalized percentage for a channel from a
+/// snapshot's `prev_values`, if available.
+fn prev_normalized_pct(snapshot: &PressureSnapshot, channel: Channel) -> Option<f64> {
+    let cfg = crate::channels::FeedbackConfig::from_defaults();
+    let criticals = cfg.system.criticals();
+    snapshot.prev_values.as_ref().map(|prev| {
+        prev[channel.index()] / criticals[channel.index()] * 100.0
+    })
+}
+
 /// Generate channel-specific guidance when denying a tool call.
+/// Context is handled via Modify, not Deny, so it is unreachable here —
+/// `evaluate_decision` skips `Channel::Context` in the deny loop.
 fn deny_guidance(channel: Channel, tool_name: &str) -> String {
     match channel {
         Channel::Context => {
-            "Context window is filling up. Summarize what you know and \
-             work with existing information instead of reading more files."
-                .into()
+            // Unreachable in practice. Keep a harmless fallback rather
+            // than panicking: if a future caller ever routes Context
+            // through the deny path we should surface *something*
+            // instead of crashing the hook.
+            "Context pressure is high.".into()
         }
         Channel::Error => {
             "Too many unresolved errors. Focus on fixing the current error \
@@ -314,6 +376,7 @@ mod tests {
         values[channel.index()] = criticals[channel.index()] * fraction;
         PressureSnapshot {
             values,
+            prev_values: None,
             composite_stress: fraction,
             spectral_gap: 0.5,
             is_stable: true,
@@ -324,6 +387,7 @@ mod tests {
     fn allow_when_all_channels_low() {
         let snapshot = PressureSnapshot {
             values: vec![0.0; Channel::DIM],
+            prev_values: None,
             composite_stress: 0.0,
             spectral_gap: 1.0,
             is_stable: true,
@@ -337,6 +401,7 @@ mod tests {
     fn deny_when_unstable() {
         let snapshot = PressureSnapshot {
             values: vec![0.0; Channel::DIM],
+            prev_values: None,
             composite_stress: 0.0,
             spectral_gap: 0.001,
             is_stable: false,
@@ -485,6 +550,60 @@ mod tests {
     }
 
     #[test]
+    fn context_above_deny_threshold_becomes_modify_not_deny() {
+        // Context at 95% of critical — normally would be solidly in
+        // the deny zone (deny=0.85). Context is demoted: the verdict
+        // must be a Modify that narrows the Read, never a Deny that
+        // stalls the agent before Claude Code's own auto-compactor
+        // can fire.
+        let snapshot = snapshot_with_channel_at(Channel::Context, 0.95);
+        let thresholds = ChannelThresholds::default();
+        let tool_input = serde_json::json!({"file_path": "/foo/bar.rs"});
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", Some(&tool_input));
+        match decision {
+            Decision::Modify { patch, reason } => {
+                assert!(
+                    reason.contains("context"),
+                    "reason should mention context: {reason}"
+                );
+                let updated = patch.updated_input.expect("Read patch must produce updated_input");
+                assert_eq!(updated["limit"], 200, "limit capped to 200 even in deny zone");
+            }
+            other => panic!("expected Modify (context is demoted), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_above_deny_threshold_does_not_shadow_other_channels() {
+        // Context at 95% AND Error at 90% — previously Context would
+        // have won the deny loop (first in Channel::ALL order), now
+        // it's skipped so Error correctly surfaces as the deny reason.
+        let cfg = crate::channels::FeedbackConfig::from_defaults();
+        let criticals = cfg.system.criticals();
+        let mut values = vec![0.0; Channel::DIM];
+        values[Channel::Context.index()] = criticals[Channel::Context.index()] * 0.95;
+        values[Channel::Error.index()] = criticals[Channel::Error.index()] * 0.90;
+        let snapshot = PressureSnapshot {
+            values,
+            prev_values: None,
+            composite_stress: 0.92,
+            spectral_gap: 0.5,
+            is_stable: true,
+        };
+        let thresholds = ChannelThresholds::default();
+        let decision = evaluate_decision(&snapshot, &thresholds, "Read", None);
+        match decision {
+            Decision::Deny { reason } => {
+                assert!(
+                    reason.contains("error"),
+                    "error must surface through; context is demoted: {reason}"
+                );
+            }
+            other => panic!("expected Deny on error channel, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn deny_takes_priority_over_warn() {
         // Error at 90% (deny zone) AND context at 70% (warn zone).
         // Deny must win.
@@ -495,6 +614,7 @@ mod tests {
         values[Channel::Error.index()] = criticals[Channel::Error.index()] * 0.90;
         let snapshot = PressureSnapshot {
             values,
+            prev_values: None,
             composite_stress: 0.85,
             spectral_gap: 0.5,
             is_stable: true,

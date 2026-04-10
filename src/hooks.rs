@@ -20,7 +20,7 @@
 //! the Governor, not as a pressure channel.
 
 use crate::channels::Channel;
-use crate::decision::Decision;
+use crate::decision::{Decision, GovernorVerdict};
 use crate::governor::Governor;
 use crate::hook_protocol::{HookInput, HookOutput};
 
@@ -55,11 +55,21 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
         "Read" => {
             // Context: measured median 1175 tokens (range 289-8032).
             governor.record_impulse(Channel::Context, 1175.0);
-            // Repetition: only on revisit (plan docs excluded).
+            // Repetition: harmonic decay on re-visit (plan docs
+            // excluded). Each additional re-read carries less
+            // surprise than the one before it: count=2 → 1.0,
+            // count=3 → 0.5, count=4 → 0.33. Sum over N total
+            // accesses ≈ H(N-1) ≈ ln(N-1). A focused 10-read
+            // session on one file totals ~2.83 (well below warn
+            // band); a runaway 10,000-read loop totals ~9.79
+            // (firmly in critical). Rationale: focused engineering
+            // on a single file was firing false-positive blocks
+            // under the previous flat 1.0-per-revisit policy.
             if !file_path.is_empty() && !is_plan_file {
                 let count = governor.record_file_access(file_path);
                 if count > 1 {
-                    governor.record_impulse(Channel::Repetition, 1.0);
+                    let magnitude = 1.0 / (count as f64 - 1.0);
+                    governor.record_impulse(Channel::Repetition, magnitude);
                 }
             }
         }
@@ -78,11 +88,16 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
             governor.record_impulse(Channel::Context, 200.0);
             // Progress: forward motion.
             governor.record_impulse(Channel::Progress, -3.0);
-            // Repetition: only on revisit (plan docs excluded).
+            // Repetition: harmonic decay on re-visit, half the Read
+            // base since Edit is itself forward motion (it already
+            // pulls Progress down). count=2 → 0.5, count=3 → 0.25,
+            // etc. See the Read arm for the rationale behind
+            // harmonic decay over flat per-revisit impulses.
             if !file_path.is_empty() && !is_plan_file {
                 let count = governor.record_file_access(file_path);
                 if count > 1 {
-                    governor.record_impulse(Channel::Repetition, 0.5);
+                    let magnitude = 0.5 / (count as f64 - 1.0);
+                    governor.record_impulse(Channel::Repetition, magnitude);
                 }
             }
         }
@@ -138,6 +153,56 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
     // replay via analyze_session.py.
 }
 
+/// Apply impulses for a parsed hook input and return the verdict
+/// without serializing it. The binary uses this when it needs to
+/// inspect the verdict (e.g., for telemetry on non-Allow decisions)
+/// before converting to hook output.
+pub fn evaluate_pre_tool_use(
+    input_json: &str,
+    governor: &mut Governor,
+) -> Result<GovernorVerdict, serde_json::Error> {
+    let input: HookInput = serde_json::from_str(input_json)?;
+    // Apply all impulses (including progress stall accumulation)
+    apply_impulses(&input, governor);
+    // We pass the actual tool_input through so warn-zone Modify
+    // verdicts can produce concrete patched arguments (e.g., capping
+    // a Read's `limit`).
+    Ok(governor.evaluate_with_input(&input.tool_name, Some(&input.tool_input)))
+}
+
+/// Convert a GovernorVerdict into the JSON string that goes back
+/// to Claude Code on stdout. The Modify branch has two sub-cases:
+/// a tool-specific patch produced an `updated_input` (then we use
+/// allow_with_modification), or only `additional_context` is set
+/// (then we surface the warning text via allow_with_warning so the
+/// agent still sees the guidance even though we aren't patching
+/// the call). Either way the warning reason makes it back to the
+/// agent — never silently dropped.
+///
+/// `extra_context` is out-of-band guidance the hook binary wants to
+/// attach alongside the verdict — currently used by the compaction
+/// watchdog to nudge the agent to chunk its work after repeated
+/// auto-compactions. It is layered on top of whatever the Decision
+/// already produced without flipping the permission verdict.
+pub fn verdict_to_output(
+    verdict: &GovernorVerdict,
+    extra_context: Option<String>,
+) -> Result<String, serde_json::Error> {
+    let output = match &verdict.decision {
+        Decision::Allow => HookOutput::allow(),
+        Decision::Deny { reason } => HookOutput::deny(reason),
+        Decision::Modify { reason, patch } => match &patch.updated_input {
+            Some(updated) => HookOutput::allow_with_modification(reason, updated.clone()),
+            None => HookOutput::allow_with_warning(reason),
+        },
+    };
+    let output = match extra_context {
+        Some(ctx) if !ctx.is_empty() => output.with_additional_context(ctx),
+        _ => output,
+    };
+    serde_json::to_string(&output)
+}
+
 /// Handle a PreToolUse hook invocation.
 ///
 /// This is the main entry point called by the hook script/binary.
@@ -145,42 +210,17 @@ fn apply_impulses(input: &HookInput, governor: &mut Governor) {
 /// 2. Accumulate progress stall since last call
 /// 3. Map tool call to orthogonal pressure impulses
 /// 4. Evaluate and return the decision
+///
+/// The two-step decomposition (`evaluate_pre_tool_use` +
+/// `verdict_to_output`) is also exposed publicly for callers that
+/// need to inspect the verdict before serializing it — see the
+/// `feedback-hook` binary's block-event telemetry for the use case.
 pub fn handle_pre_tool_use(
     input_json: &str,
     governor: &mut Governor,
 ) -> Result<String, serde_json::Error> {
-    let input: HookInput = serde_json::from_str(input_json)?;
-
-    // Apply all impulses (including progress stall accumulation)
-    apply_impulses(&input, governor);
-
-    // Evaluate the pressure state. We pass the actual tool_input
-    // through so warn-zone Modify verdicts can produce concrete
-    // patched arguments (e.g., capping a Read's `limit`).
-    let verdict = governor.evaluate_with_input(&input.tool_name, Some(&input.tool_input));
-
-    // Convert to hook output. The Modify branch has two sub-cases:
-    // a tool-specific patch produced an `updated_input` (then we use
-    // allow_with_modification), or only `additional_context` is set
-    // (then we surface the warning text via allow_with_warning so the
-    // agent still sees the guidance even though we aren't patching
-    // the call). Either way the warning reason makes it back to the
-    // agent — never silently dropped.
-    let output = match verdict.decision {
-        Decision::Allow => HookOutput::allow(),
-        Decision::Deny { ref reason } => HookOutput::deny(reason),
-        Decision::Modify {
-            ref reason,
-            ref patch,
-        } => match &patch.updated_input {
-            Some(updated) => {
-                HookOutput::allow_with_modification(reason, updated.clone())
-            }
-            None => HookOutput::allow_with_warning(reason),
-        },
-    };
-
-    serde_json::to_string(&output)
+    let verdict = evaluate_pre_tool_use(input_json, governor)?;
+    verdict_to_output(&verdict, None)
 }
 
 #[cfg(test)]
@@ -221,6 +261,34 @@ mod tests {
             vals[Channel::Repetition.index()] > 0.5,
             "revisit should fire repetition, got {}",
             vals[Channel::Repetition.index()]
+        );
+    }
+
+    #[test]
+    fn focused_rereading_does_not_saturate_repetition() {
+        // Regression: under the previous flat 1.0-per-revisit
+        // policy, seven re-reads of the same file pushed the
+        // repetition channel past its critical threshold and
+        // blocked further tool calls during focused single-file
+        // engineering. Harmonic decay caps the total impulse at
+        // ≈ H(N-1) ≈ ln(N-1), so even a 20-read session on one
+        // file stays well below the warn band.
+        let mut gov = Governor::from_defaults();
+        let input = make_input("Read", serde_json::json!({"file_path": "/foo/bar.rs"}));
+        for _ in 0..10 {
+            apply_impulses(&input, &mut gov);
+        }
+        let rep = gov.current_values()[Channel::Repetition.index()];
+        // Analytic ceiling: H(9) = 1 + 1/2 + ... + 1/9 ≈ 2.83.
+        // Time decay pulls the observed value a bit lower.
+        assert!(
+            rep < 4.0,
+            "10 re-reads should not saturate repetition, got {rep}"
+        );
+        // Still positive — the signal isn't gone, just damped.
+        assert!(
+            rep > 0.5,
+            "repetition should still accumulate meaningfully, got {rep}"
         );
     }
 

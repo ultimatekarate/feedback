@@ -102,6 +102,7 @@ mod tests {
             decision,
             snapshot: PressureSnapshot {
                 values: vec![0.0; Channel::DIM],
+                prev_values: None,
                 composite_stress: 0.0,
                 spectral_gap: 1.0,
                 is_stable: true,

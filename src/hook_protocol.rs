@@ -41,6 +41,13 @@ pub struct HookDecision {
     /// Modified tool input, if the governor wants to adjust the call.
     #[serde(rename = "updatedInput", skip_serializing_if = "Option::is_none")]
     pub updated_input: Option<serde_json::Value>,
+    /// Free-form guidance the agent will see alongside the decision.
+    /// Independent of `permission_decision_reason` — the latter is
+    /// coupled to deny/modify verdicts, while `additional_context` is
+    /// used to nudge the agent even on pure allows (e.g., compaction
+    /// watchdog warnings).
+    #[serde(rename = "additionalContext", skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<String>,
 }
 
 impl HookOutput {
@@ -52,6 +59,7 @@ impl HookOutput {
                 permission_decision: "allow".into(),
                 permission_decision_reason: String::new(),
                 updated_input: None,
+                additional_context: None,
             },
         }
     }
@@ -64,6 +72,7 @@ impl HookOutput {
                 permission_decision: "deny".into(),
                 permission_decision_reason: reason.to_string(),
                 updated_input: None,
+                additional_context: None,
             },
         }
     }
@@ -76,6 +85,7 @@ impl HookOutput {
                 permission_decision: "allow".into(),
                 permission_decision_reason: reason.to_string(),
                 updated_input: Some(updated_input),
+                additional_context: None,
             },
         }
     }
@@ -92,8 +102,19 @@ impl HookOutput {
                 permission_decision: "allow".into(),
                 permission_decision_reason: reason.to_string(),
                 updated_input: None,
+                additional_context: None,
             },
         }
+    }
+
+    /// Attach `additionalContext` guidance to an existing response.
+    /// Used by the compaction watchdog to surface advice without
+    /// changing the underlying permission decision — an allow remains
+    /// an allow, a modify remains a modify, but the agent sees the
+    /// extra context alongside.
+    pub fn with_additional_context(mut self, context: String) -> Self {
+        self.hook_specific_output.additional_context = Some(context);
+        self
     }
 }
 
@@ -132,5 +153,36 @@ mod tests {
         // No updatedInput field — must be omitted, not null,
         // because skip_serializing_if = "Option::is_none".
         assert!(!json.contains("updatedInput"));
+    }
+
+    #[test]
+    fn additional_context_is_omitted_when_none() {
+        // Default builders must not emit additionalContext at all —
+        // an empty/null field would make Claude Code surface an empty
+        // note to the agent on every single allow.
+        for output in [
+            HookOutput::allow(),
+            HookOutput::deny("x"),
+            HookOutput::allow_with_warning("y"),
+        ] {
+            let json = serde_json::to_string(&output).unwrap();
+            assert!(
+                !json.contains("additionalContext"),
+                "default output must not serialize additionalContext: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_additional_context_attaches_guidance() {
+        let output = HookOutput::allow().with_additional_context(
+            "You compacted twice recently — consider breaking work into chunks.".into(),
+        );
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"additionalContext\""));
+        assert!(json.contains("compacted twice recently"));
+        // The underlying decision is still an allow — watchdog guidance
+        // never flips the verdict.
+        assert!(json.contains("\"permissionDecision\":\"allow\""));
     }
 }

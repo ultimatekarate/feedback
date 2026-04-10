@@ -10,6 +10,13 @@ use serde::{Deserialize, Serialize};
 pub struct PressureSnapshot {
     /// Current integral values per channel.
     pub values: Vec<f64>,
+    /// Pressure values from the previous tool call, if available.
+    /// Used by the monitor to compute trajectory (rising/falling/stable)
+    /// and include it in deny/warn messages so the agent can distinguish
+    /// transient pressure (attrition is viable) from escalating pressure
+    /// (strategy change is needed).
+    #[serde(default)]
+    pub prev_values: Option<Vec<f64>>,
     /// Composite stress (weighted sum of scaler values).
     pub composite_stress: f64,
     /// Spectral gap gamma_1. Distance from instability boundary.

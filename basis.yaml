@@ -68,6 +68,7 @@ layers:
     packages:
       - "src/governor"
       - "src/hooks"
+      - "src/post_tool"
       - "src/session"
       - "src/bin"
     rules:
