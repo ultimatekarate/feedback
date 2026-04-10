@@ -872,6 +872,44 @@ fn handle_event(input_str: &str, dir: &Path) -> Result<String, Box<dyn std::erro
     // nothing for Idiom to check.
     if event == "PostToolUse" {
         let tool = input.tool_name.as_str();
+
+        // ── Bash error path: nonzero exit code → Error channel ──
+        // Claude Code sends `tool_response.exitCode` on PostToolUse
+        // for Bash. A nonzero exit code means a build failure, test
+        // failure, or other command error — deposit a fixed impulse
+        // on the Error channel so repeated failures accumulate and
+        // eventually trigger warn/deny. No pending context is
+        // stashed: the agent already saw the error output.
+        if tool == "Bash" {
+            let is_error = raw
+                .get("tool_response")
+                .and_then(|r| r.get("exitCode"))
+                .and_then(|c| c.as_i64())
+                .map(|c| c != 0)
+                .unwrap_or(false);
+            if is_error {
+                let impulse = post_tool::BASH_ERROR_IMPULSE;
+                append_impulse_log_entry(
+                    dir,
+                    &input.session_id,
+                    wall_clock_secs(),
+                    "bash_error",
+                    1,
+                    impulse,
+                    &std::collections::BTreeMap::new(),
+                );
+                record_impulse_to_disk(
+                    dir,
+                    &input.session_id,
+                    Channel::Error,
+                    impulse,
+                    PendingContext { idiom: None, basis: None },
+                );
+            }
+            return Ok("{}".to_string());
+        }
+
+        // ── Write/Edit path: idiom + basis checks → Error channel ──
         if tool != "Write" && tool != "Edit" && tool != "MultiEdit" {
             return Ok("{}".to_string());
         }
@@ -1142,6 +1180,18 @@ mod tests {
             "tool_name": tool,
             "tool_input": {"file_path": file_path},
             "tool_response": {},
+        })
+        .to_string()
+    }
+
+    /// Build a PostToolUse payload for a Bash command with a specific exit code.
+    fn post_tool_use_bash_payload(session_id: &str, exit_code: i64) -> String {
+        serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": session_id,
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
+            "tool_response": {"exitCode": exit_code},
         })
         .to_string()
     }
@@ -1915,13 +1965,94 @@ mod tests {
     }
 
     #[test]
-    fn posttool_on_bash_does_not_touch_state() {
-        // Same shape as Read: Bash never writes a source file.
+    fn posttool_on_bash_success_does_not_touch_state() {
+        // A successful Bash (exitCode absent or 0) must not create
+        // a state file — only failures deposit Error-channel pressure.
         let dir = tempfile::tempdir().expect("tempdir");
         let payload = post_tool_use_payload("bashsess", "Bash", "");
         let out = handle_event(&payload, dir.path()).expect("ok");
         assert_eq!(out, "{}");
         assert!(!dir.path().join("bashsess.json").exists());
+    }
+
+    #[test]
+    fn posttool_on_bash_exit_zero_does_not_touch_state() {
+        // Explicit exitCode: 0 is a success — no impulse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = post_tool_use_bash_payload("bash0", 0);
+        let out = handle_event(&payload, dir.path()).expect("ok");
+        assert_eq!(out, "{}");
+        assert!(!dir.path().join("bash0.json").exists());
+    }
+
+    #[test]
+    fn posttool_on_bash_nonzero_exit_creates_error_pressure() {
+        // A nonzero exit code (build failure, test failure) must
+        // deposit BASH_ERROR_IMPULSE on the Error channel.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = post_tool_use_bash_payload("bashfail", 1);
+        let out = handle_event(&payload, dir.path()).expect("ok");
+        assert_eq!(out, "{}");
+
+        // State file must exist with Error-channel pressure.
+        let state_path = dir.path().join("bashfail.json");
+        assert!(state_path.exists(), "failed Bash must create state file");
+        let bytes = std::fs::read(&state_path).unwrap();
+        let state: PersistedState = serde_json::from_slice(&bytes).unwrap();
+        let err_val = state.bank.current_value(Channel::Error.index(), state.last_call_t);
+        assert!(
+            err_val > 0.0,
+            "Error channel must have pressure after bash failure, got {err_val}"
+        );
+    }
+
+    #[test]
+    fn posttool_on_bash_failure_writes_impulse_log() {
+        // The impulse log must record a bash_error source entry so
+        // SessionEnd can attribute the pressure in the digest.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = post_tool_use_bash_payload("bashlog", 2);
+        let _ = handle_event(&payload, dir.path()).expect("ok");
+
+        let log_path = impulse_log_path(dir.path(), "bashlog");
+        assert!(log_path.exists(), "bash failure must write impulse log");
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(entry["source"], "bash_error");
+        assert_eq!(entry["channel"], "Error");
+        let impulse = entry["impulse"].as_f64().unwrap();
+        assert!(
+            (impulse - post_tool::BASH_ERROR_IMPULSE).abs() < 1e-9,
+            "impulse must be BASH_ERROR_IMPULSE, got {impulse}"
+        );
+    }
+
+    #[test]
+    fn posttool_bash_failure_accumulates_across_calls() {
+        // Two consecutive bash failures must both deposit pressure.
+        // The second call's Error value must be strictly greater than
+        // the first's, proving accumulation (not overwrite).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _ = handle_event(
+            &post_tool_use_bash_payload("accum", 1),
+            dir.path(),
+        ).expect("ok");
+        let bytes1 = std::fs::read(dir.path().join("accum.json")).unwrap();
+        let s1: PersistedState = serde_json::from_slice(&bytes1).unwrap();
+        let err1 = s1.bank.current_value(Channel::Error.index(), s1.last_call_t);
+
+        let _ = handle_event(
+            &post_tool_use_bash_payload("accum", 1),
+            dir.path(),
+        ).expect("ok");
+        let bytes2 = std::fs::read(dir.path().join("accum.json")).unwrap();
+        let s2: PersistedState = serde_json::from_slice(&bytes2).unwrap();
+        let err2 = s2.bank.current_value(Channel::Error.index(), s2.last_call_t);
+
+        assert!(
+            err2 > err1,
+            "second failure must accumulate: {err2} > {err1}"
+        );
     }
 
     #[test]

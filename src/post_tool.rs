@@ -125,6 +125,22 @@ pub fn deviations_to_impulse(count: u64) -> f64 {
     }
 }
 
+/// Impulse deposited on the Error channel for a Bash tool failure
+/// (nonzero exit code or `is_error` flag from Claude Code).
+///
+/// A single build failure is worth 1.5 error-units — half the channel's
+/// critical budget (6.0). With the 24-second half-life, two consecutive
+/// failures 30 seconds apart accumulate to `1.5 + 1.5*e^(-0.029*30) ≈ 2.5`
+/// (below warn), and three at that pace reach `≈ 3.2` (near warn at 3.6).
+/// This means the channel distinguishes a one-off failure (pressure decays
+/// before warn) from a sustained spiral (3+ failures within a minute cross
+/// warn and start generating Modify verdicts).
+///
+/// Set slightly higher than the per-deviation impulse (0.5) because a
+/// build failure is more disruptive — the agent cannot make progress
+/// until it's resolved, and each failed attempt wastes context tokens.
+pub const BASH_ERROR_IMPULSE: f64 = 1.5;
+
 /// Decide whether `path` is something Idiom should look at. Pure
 /// extension test — Idiom's own language detection is the source of
 /// truth, this is just a cheap pre-filter so we don't spawn `idiom-cli`
