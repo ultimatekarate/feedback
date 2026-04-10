@@ -820,6 +820,27 @@ fn handle_event(input_str: &str, dir: &Path) -> Result<String, Box<dyn std::erro
                 }
             }
         }
+        // Write the SessionDigest JSON alongside the state file.
+        // The digest is accumulated incrementally in PersistedState
+        // across PreToolUse invocations, so we just deserialize the
+        // state, extract the digest, and serialize it to its own file.
+        // Best-effort: failure is invisible to the agent.
+        let session_file = format!("{}.json", sanitize_session_id(session_id));
+        let state_path = dir.join(&session_file);
+        if let Ok(bytes) = std::fs::read(&state_path) {
+            if let Ok(state) = serde_json::from_slice::<PersistedState>(&bytes) {
+                let digest_json_path = dir.join(format!(
+                    "{}-digest.json",
+                    sanitize_session_id(session_id)
+                ));
+                let tmp = digest_json_path.with_extension("json.tmp");
+                if let Ok(json) = serde_json::to_string_pretty(&state.digest) {
+                    if std::fs::write(&tmp, &json).is_ok() {
+                        let _ = std::fs::rename(&tmp, &digest_json_path);
+                    }
+                }
+            }
+        }
         // Read-and-clear semantics for the per-session impulse log:
         // SessionEnd is the last consumer of this file, so deleting
         // it now keeps the state directory tidy and prevents a
@@ -1806,6 +1827,45 @@ mod tests {
         assert!(body.contains("**Deny** `Bash`"));
         // The beta session must NOT bleed into alpha's digest.
         assert!(!body.contains("latency"));
+    }
+
+    #[test]
+    fn session_end_writes_session_digest_json() {
+        // Plant a persisted state file with a non-trivial digest.
+        // SessionEnd must write `<session>-digest.json` containing
+        // the serialized SessionDigest.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sid = "digest-test";
+
+        // Build a governor, push some pressure, and snapshot.
+        let mut gov = Governor::from_defaults();
+        gov.record_impulse(Channel::Error, 3.0);
+        let _ = gov.evaluate("Bash");
+        let state = gov.snapshot();
+
+        let state_file = format!("{}.json", sanitize_session_id(sid));
+        let state_bytes = serde_json::to_vec(&state).expect("serialize");
+        std::fs::write(dir.path().join(&state_file), &state_bytes).expect("write state");
+
+        let out = handle_event(&session_end_payload(sid), dir.path()).expect("ok");
+        assert_eq!(out, "{}");
+
+        let digest_path = dir.path().join(format!("{}-digest.json", sanitize_session_id(sid)));
+        assert!(digest_path.exists(), "SessionEnd must write digest JSON");
+
+        let digest_text = std::fs::read_to_string(&digest_path).expect("read");
+        let digest: feedback::session::SessionDigest =
+            serde_json::from_str(&digest_text).expect("parse digest JSON");
+
+        assert_eq!(digest.total_evaluations, 1);
+        assert!(
+            digest.peak_pressure[Channel::Error.index()] > 0.0,
+            "error channel should have non-zero peak"
+        );
+        assert!(
+            digest.total_impulses[Channel::Error.index()] > 0.0,
+            "error channel should have recorded impulses"
+        );
     }
 
     #[test]

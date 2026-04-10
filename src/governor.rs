@@ -14,6 +14,7 @@ use crate::channels::{Channel, FeedbackConfig};
 use crate::decision::GovernorVerdict;
 use crate::monitor;
 use crate::pressure_model::AgentCouplingModel;
+use crate::session::SessionDigest;
 
 /// Gaps longer than this (seconds) are treated as session suspensions
 /// — overnight, lunch, context switch — rather than stalls or decay.
@@ -118,6 +119,11 @@ pub struct PersistedState {
     /// falling) and include it in deny/warn messages.
     #[serde(default)]
     pub prev_values: Vec<f64>,
+    /// Incrementally accumulated session digest. Updated on every
+    /// `evaluate` call and persisted so SessionEnd can write it to
+    /// `<session>-digest.json` without replaying the verdict history.
+    #[serde(default = "SessionDigest::parse_empty_session")]
+    pub digest: SessionDigest,
 }
 
 /// The live stability governor.
@@ -151,6 +157,8 @@ pub struct Governor {
     /// after each evaluation and persisted across hook invocations so
     /// the deny/warn messages can report trajectory (rising/falling).
     prev_values: Vec<f64>,
+    /// Incrementally accumulated session digest.
+    digest: SessionDigest,
 }
 
 impl Governor {
@@ -172,6 +180,7 @@ impl Governor {
             last_call_t: 0.0,
             cumulative_cost: 0.0,
             prev_values: Vec::new(),
+            digest: SessionDigest::parse_empty_session(),
         }
     }
 
@@ -264,6 +273,7 @@ impl Governor {
             last_call_t: caught_up_t,
             cumulative_cost: state.cumulative_cost,
             prev_values: state.prev_values,
+            digest: state.digest,
         }
     }
 
@@ -293,7 +303,13 @@ impl Governor {
             // the per-process boundary of each hook invocation.
             saved_wall_secs: wall_now_secs(),
             prev_values: self.prev_values.clone(),
+            digest: self.digest.clone(),
         }
+    }
+
+    /// Return a reference to the current session digest.
+    pub fn digest(&self) -> &SessionDigest {
+        &self.digest
     }
 
     /// Create a governor with default parameters.
@@ -341,6 +357,7 @@ impl Governor {
     pub fn record_impulse(&mut self, channel: Channel, impulse: f64) {
         let now = self.now();
         self.bank.record(channel.index(), impulse, now);
+        self.digest.parse_record_impulse_session(channel.index(), impulse);
     }
 
     /// Record a file access and return the total access count.
@@ -417,6 +434,17 @@ impl Governor {
             &self.config.thresholds,
             tool_name,
             tool_input,
+        );
+
+        // Update the session digest with this evaluation's snapshot.
+        let criticals: Vec<f64> = self.config.system.channels.iter().map(|c| c.critical).collect();
+        let dt = now - self.last_call_t;
+        self.digest.parse_update_session(
+            &values,
+            &criticals,
+            &self.config.thresholds.warn,
+            &self.config.thresholds.deny,
+            dt.max(0.0),
         );
 
         // Save current values for trajectory computation on next call.

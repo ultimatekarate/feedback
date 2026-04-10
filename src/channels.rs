@@ -144,7 +144,7 @@ impl FeedbackConfig {
                 name: "error".into(),
                 // Fix cycle duration: detect error → read source → edit fix
                 // → verify. Measured from inter-test-invocation intervals
-                // across sessions: ~4 min.
+                // across sessions: ~4 minutes.
                 // lambda = ln(2)/240 ≈ 0.0029
                 lambda: 0.0029,
                 // Units: weighted error count (1.0 per is_error, 0.5 per
