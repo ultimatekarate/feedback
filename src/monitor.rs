@@ -71,10 +71,10 @@ pub fn check_stability(
 ///    - Otherwise the Modify carries only an
 ///      `additional_context` warning so the agent
 ///      sees the guidance even with no input patch.
-///    Context is also included at this tier — if its normalised value
-///    is anywhere above the warn threshold (including what would have
-///    been the deny zone), it produces a Modify with a Read/Grep
-///    narrowing patch instead of blocking the call.
+///      Context is also included at this tier — if its normalised value
+///      is anywhere above the warn threshold (including what would have
+///      been the deny zone), it produces a Modify with a Read/Grep
+///      narrowing patch instead of blocking the call.
 /// 5. Otherwise                                        → Allow
 ///
 /// `tool_input` is the raw JSON arguments the agent supplied for the

@@ -1860,7 +1860,7 @@ mod tests {
         // The digest must include only the matching session and must
         // be readable as plain text.
         let dir = tempfile::tempdir().expect("tempdir");
-        let lines = vec![
+        let lines = [
             r#"{"ts":1.0,"session_id":"alpha","tool_name":"Read","decision":"Modify","reason":"context","channel_values":[],"cumulative_cost":0.0}"#,
             r#"{"ts":2.0,"session_id":"beta","tool_name":"Bash","decision":"Deny","reason":"latency","channel_values":[],"cumulative_cost":0.0}"#,
             r#"{"ts":3.0,"session_id":"alpha","tool_name":"Bash","decision":"Deny","reason":"error","channel_values":[],"cumulative_cost":0.0}"#,

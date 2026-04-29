@@ -237,9 +237,7 @@ impl Governor {
         // rather than jumping the clock forward by 55 years of
         // UNIX_EPOCH drift.
         let wall_gap = if state.saved_wall_secs > 0.0 {
-            (wall_now_secs() - state.saved_wall_secs)
-                .max(0.0)
-                .min(MAX_STALL_GAP)
+            (wall_now_secs() - state.saved_wall_secs).clamp(0.0, MAX_STALL_GAP)
         } else {
             0.0
         };

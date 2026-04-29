@@ -4,7 +4,7 @@ A real-time stability governor for agentic coding workflows. Feedback monitors A
 
 ## How it works
 
-Feedback tracks five orthogonal pressure channels, each measuring a distinct failure mode:
+Feedback tracks five "orthogonal" (In anticipation of friendly fire: I am fully aware that the channels aren't actually orthogonal. Do you see a definition of an inner product here?) pressure channels, each measuring a distinct failure mode:
 
 | Channel | What it measures | Half-life |
 |---------|-----------------|-----------|

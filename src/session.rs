@@ -138,8 +138,8 @@ impl SessionLog {
 
         let mut peak = vec![0.0_f64; Channel::DIM];
         for v in &self.verdicts {
-            for i in 0..Channel::DIM.min(v.snapshot.values.len()) {
-                peak[i] = peak[i].max(v.snapshot.values[i]);
+            for (p, val) in peak.iter_mut().zip(v.snapshot.values.iter()).take(Channel::DIM) {
+                *p = p.max(*val);
             }
         }
 
@@ -164,7 +164,7 @@ impl SessionLog {
     /// Write the session log to a JSON file for post-hoc analysis.
     pub fn write_to_file(&self, path: &Path) -> io::Result<()> {
         let json = serde_json::to_string_pretty(&self.verdicts)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         std::fs::write(path, json)
     }
 }
@@ -214,8 +214,8 @@ mod tests {
         let warn = vec![0.60; Channel::DIM];
         let deny = vec![0.85; Channel::DIM];
 
-        d.parse_update_session(&vec![10.0, 20.0, 30.0, 40.0, 50.0], &criticals, &warn, &deny, 0.0);
-        d.parse_update_session(&vec![5.0, 25.0, 15.0, 45.0, 10.0], &criticals, &warn, &deny, 1.0);
+        d.parse_update_session(&[10.0, 20.0, 30.0, 40.0, 50.0], &criticals, &warn, &deny, 0.0);
+        d.parse_update_session(&[5.0, 25.0, 15.0, 45.0, 10.0], &criticals, &warn, &deny, 1.0);
 
         assert!((d.peak_pressure[0] - 10.0).abs() < 1e-10);
         assert!((d.peak_pressure[1] - 25.0).abs() < 1e-10);
