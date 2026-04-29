@@ -15,7 +15,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Clippy
-        run: cargo clippy --manifest-path feedback/Cargo.toml -- -D warnings
+        run: cargo clippy
 
       - name: Build feedback
         run: cargo build 
