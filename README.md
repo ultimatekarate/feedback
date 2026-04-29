@@ -1,3 +1,6 @@
+[![CI](https://github.com/ultimatekarate/feedback/actions/workflows/ci.yml/badge.svg)](https://github.com/ultimatekarate/feedback/actions/workflows/ci.yml)
+
+
 # Feedback
 
 A real-time stability governor for agentic coding workflows. Feedback monitors AI agent sessions using Volterra integral pressure analysis to detect when an agent is spiraling — filling context, looping on errors, thrashing files — and intervenes before the session degrades.
