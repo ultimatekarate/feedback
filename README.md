@@ -1,5 +1,6 @@
 [![CI](https://github.com/ultimatekarate/feedback/actions/workflows/ci.yml/badge.svg)](https://github.com/ultimatekarate/feedback/actions/workflows/ci.yml)
 
+**DEVELOPMENT NOTE:** I am no longer actively developing this. The core is done, all that is left is calibration. That requires a massive data collection and labeling effort that I do not have time to undertake. I am happy to provide my insights to anyone who decides to do it.
 
 # Feedback
 
